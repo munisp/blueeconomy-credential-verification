@@ -1,0 +1,23 @@
+{
+  "name": "@munisp/blueeconomy-credential-verification",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Issuer-backed credential verification controls for the Blue Economy Platform",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "scripts": {
+    "build": "tsc --noEmit",
+    "test": "node --test --import tsx tests/**/*.test.ts",
+    "verify": "npm run build && npm test"
+  },
+  "dependencies": {
+    "jose": "6.2.8"
+  },
+  "devDependencies": {
+    "@types/node": "26.2.0",
+    "tsx": "4.23.12",
+    "typescript": "7.0.2"
+  }
+}
