@@ -38,13 +38,16 @@ export function parseConfiguration(args: readonly string[]): VerificationConfigu
     values.set(name, value);
   }
 
-  const credentialPath = required(values, "--credential");
+  const credentialPath = resolve(required(values, "--credential"));
   const issuer = parseHttpsUrl(required(values, "--issuer"), "issuer").toString();
   const audience = required(values, "--audience");
   const jwksUrl = parseHttpsUrl(required(values, "--jwks-url"), "jwks-url");
-  const evidencePath = required(values, "--evidence");
+  const evidencePath = resolve(required(values, "--evidence"));
   if (values.size !== 5) {
     throw new Error("unexpected argument supplied");
+  }
+  if (credentialPath === evidencePath || credentialPath === `${evidencePath}.tmp`) {
+    throw new Error("evidence path or staging path must not overwrite the credential input");
   }
   return { credentialPath, issuer, audience, jwksUrl, evidencePath };
 }

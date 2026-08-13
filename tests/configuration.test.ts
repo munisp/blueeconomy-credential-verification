@@ -17,6 +17,34 @@ test("rejects a non-HTTPS JWKS URL", () => {
   );
 });
 
+test("rejects an evidence path that aliases the credential input", () => {
+  assert.throws(
+    () =>
+      parseConfiguration([
+        "--credential", "./approved.jwt",
+        "--issuer", "https://issuer.example.invalid",
+        "--audience", "blueeconomy-platform",
+        "--jwks-url", "https://issuer.example.invalid/keys",
+        "--evidence", "nested/../approved.jwt",
+      ]),
+    /evidence path or staging path must not overwrite the credential input/,
+  );
+});
+
+test("rejects an evidence staging path that aliases the credential input", () => {
+  assert.throws(
+    () =>
+      parseConfiguration([
+        "--credential", "evidence.json.tmp",
+        "--issuer", "https://issuer.example.invalid",
+        "--audience", "blueeconomy-platform",
+        "--jwks-url", "https://issuer.example.invalid/keys",
+        "--evidence", "evidence.json",
+      ]),
+    /evidence path or staging path must not overwrite the credential input/,
+  );
+});
+
 test("rejects missing credential argument", () => {
   assert.throws(
     () =>
