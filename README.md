@@ -12,10 +12,12 @@ node --import tsx src/verify.ts \
   --issuer https://approved-issuer.example \
   --audience approved-audience \
   --jwks-url https://approved-issuer.example/.well-known/jwks.json \
+  --algorithm RS256 \
+  --require-jti true \
   --evidence /approved/evidence/credential-verification.json
 ```
 
-The evidence file stores a SHA-256 reference for the credential, a hashed subject reference when available, issuer/audience, key ID and issued/expiry times. It does not store the compact JWT, the raw subject, private keys, password material or credential claims.
+The evidence file stores a SHA-256 reference for the credential, a hashed subject reference when available, issuer/audience, key ID and issued/expiry times. For a status/revocation-capable profile, `--require-jti true` requires a non-empty JWT `jti` and records only a SHA-256 reference to that identifier. It does not store the compact JWT, the raw subject, private keys, password material or credential claims. The JTI control does not replace an issuer-approved status-list or revocation endpoint.
 
 ## Integration gate
 

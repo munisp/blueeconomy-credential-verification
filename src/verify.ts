@@ -13,6 +13,7 @@ export interface VerificationConfiguration {
   jwksUrl: URL;
   algorithm: VerificationAlgorithm;
   evidencePath: string;
+  requireJti: boolean;
 }
 
 export interface VerificationEvidence {
@@ -26,6 +27,7 @@ export interface VerificationEvidence {
   issued_at?: string;
   expires_at?: string;
   key_id?: string;
+  credential_id_reference_sha256?: string;
 }
 
 export function parseConfiguration(args: readonly string[]): VerificationConfiguration {
@@ -34,7 +36,7 @@ export function parseConfiguration(args: readonly string[]): VerificationConfigu
     const name = args[index];
     const value = args[index + 1];
     if (name === undefined || value === undefined || !name.startsWith("--")) {
-      throw new Error("usage: credential-verifier --credential <path> --issuer <https-url> --audience <value> --jwks-url <https-url> --evidence <path>");
+      throw new Error("usage: credential-verifier --credential <path> --issuer <https-url> --audience <value> --jwks-url <https-url> --algorithm <name> --evidence <path> [--require-jti <true|false>]");
     }
     if (values.has(name)) {
       throw new Error(`duplicate argument: ${name}`);
@@ -48,13 +50,14 @@ export function parseConfiguration(args: readonly string[]): VerificationConfigu
   const jwksUrl = parseHttpsUrl(required(values, "--jwks-url"), "jwks-url");
   const algorithm = parseAlgorithm(required(values, "--algorithm"));
   const evidencePath = resolve(required(values, "--evidence"));
-  if (values.size !== 6) {
+  const requireJti = values.has("--require-jti") ? parseBoolean(required(values, "--require-jti"), "--require-jti") : false;
+  if (values.size !== (values.has("--require-jti") ? 7 : 6)) {
     throw new Error("unexpected argument supplied");
   }
   if (credentialPath === evidencePath || credentialPath === `${evidencePath}.tmp`) {
     throw new Error("evidence path or staging path must not overwrite the credential input");
   }
-  return { credentialPath, issuer, audience, jwksUrl, algorithm, evidencePath };
+  return { credentialPath, issuer, audience, jwksUrl, algorithm, evidencePath, requireJti };
 }
 
 export async function verifyCredential(configuration: VerificationConfiguration): Promise<VerificationEvidence> {
@@ -76,7 +79,7 @@ export async function verifyCredential(configuration: VerificationConfiguration)
     algorithms: [configuration.algorithm],
     clockTolerance: 5,
   });
-  return createEvidence(configuration, compactJwt, verified.protectedHeader.kid, verified.payload);
+  return createEvidence(configuration, compactJwt,     verified.protectedHeader.kid, verified.payload);
 }
 
 export async function writeEvidence(path: string, evidence: VerificationEvidence): Promise<void> {
@@ -104,6 +107,14 @@ function createEvidence(
   if (typeof payload.sub === "string" && payload.sub.length > 0) {
     evidence.subject_reference_sha256 = digest(payload.sub);
   }
+  if (configuration.requireJti) {
+    if (typeof payload.jti !== "string" || payload.jti.length === 0) {
+      throw new Error("credential jti is required for status and revocation evidence");
+    }
+    evidence.credential_id_reference_sha256 = digest(payload.jti);
+  } else if (typeof payload.jti === "string" && payload.jti.length > 0) {
+    evidence.credential_id_reference_sha256 = digest(payload.jti);
+  }
   if (typeof payload.iat === "number") {
     evidence.issued_at = new Date(payload.iat * 1_000).toISOString();
   }
@@ -122,6 +133,12 @@ function required(values: ReadonlyMap<string, string>, name: string): string {
     throw new Error(`${name} is required`);
   }
   return value;
+}
+
+function parseBoolean(value: string, field: string): boolean {
+  if (value === "true") return true;
+  if (value === "false") return false;
+  throw new Error(`${field} must be true or false`);
 }
 
 function parseAlgorithm(value: string): VerificationAlgorithm {

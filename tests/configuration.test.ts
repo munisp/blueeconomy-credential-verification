@@ -63,6 +63,35 @@ test("rejects an unapproved JWT algorithm", () => {
   );
 });
 
+test("accepts explicit JTI requirement", () => {
+  const configuration = parseConfiguration([
+    "--credential", "approved.jwt",
+    "--issuer", "https://issuer.example.invalid",
+    "--audience", "blueeconomy-platform",
+    "--jwks-url", "https://issuer.example.invalid/keys",
+    "--algorithm", "RS256",
+    "--evidence", "evidence.json",
+    "--require-jti", "true",
+  ]);
+  assert.equal(configuration.requireJti, true);
+});
+
+test("rejects invalid JTI requirement value", () => {
+  assert.throws(
+    () =>
+      parseConfiguration([
+        "--credential", "approved.jwt",
+        "--issuer", "https://issuer.example.invalid",
+        "--audience", "blueeconomy-platform",
+        "--jwks-url", "https://issuer.example.invalid/keys",
+        "--algorithm", "RS256",
+        "--evidence", "evidence.json",
+        "--require-jti", "yes",
+      ]),
+    /--require-jti must be true or false/,
+  );
+});
+
 test("rejects missing credential argument", () => {
   assert.throws(
     () =>
