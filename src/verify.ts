@@ -4,11 +4,14 @@ import { dirname, resolve } from "node:path";
 import process from "node:process";
 import { createRemoteJWKSet, jwtVerify, type JWTPayload } from "jose";
 
+export type VerificationAlgorithm = "RS256" | "ES256" | "EdDSA";
+
 export interface VerificationConfiguration {
   credentialPath: string;
   issuer: string;
   audience: string;
   jwksUrl: URL;
+  algorithm: VerificationAlgorithm;
   evidencePath: string;
 }
 
@@ -18,6 +21,7 @@ export interface VerificationEvidence {
   credential_reference_sha256: string;
   issuer: string;
   audience: string;
+  algorithm: VerificationAlgorithm;
   subject_reference_sha256?: string;
   issued_at?: string;
   expires_at?: string;
@@ -42,14 +46,15 @@ export function parseConfiguration(args: readonly string[]): VerificationConfigu
   const issuer = parseHttpsUrl(required(values, "--issuer"), "issuer").toString();
   const audience = required(values, "--audience");
   const jwksUrl = parseHttpsUrl(required(values, "--jwks-url"), "jwks-url");
+  const algorithm = parseAlgorithm(required(values, "--algorithm"));
   const evidencePath = resolve(required(values, "--evidence"));
-  if (values.size !== 5) {
+  if (values.size !== 6) {
     throw new Error("unexpected argument supplied");
   }
   if (credentialPath === evidencePath || credentialPath === `${evidencePath}.tmp`) {
     throw new Error("evidence path or staging path must not overwrite the credential input");
   }
-  return { credentialPath, issuer, audience, jwksUrl, evidencePath };
+  return { credentialPath, issuer, audience, jwksUrl, algorithm, evidencePath };
 }
 
 export async function verifyCredential(configuration: VerificationConfiguration): Promise<VerificationEvidence> {
@@ -68,6 +73,7 @@ export async function verifyCredential(configuration: VerificationConfiguration)
   const verified = await jwtVerify(compactJwt, jwks, {
     issuer: configuration.issuer,
     audience: configuration.audience,
+    algorithms: [configuration.algorithm],
     clockTolerance: 5,
   });
   return createEvidence(configuration, compactJwt, verified.protectedHeader.kid, verified.payload);
@@ -93,6 +99,7 @@ function createEvidence(
     credential_reference_sha256: digest(compactJwt),
     issuer: configuration.issuer,
     audience: configuration.audience,
+    algorithm: configuration.algorithm,
   };
   if (typeof payload.sub === "string" && payload.sub.length > 0) {
     evidence.subject_reference_sha256 = digest(payload.sub);
@@ -115,6 +122,13 @@ function required(values: ReadonlyMap<string, string>, name: string): string {
     throw new Error(`${name} is required`);
   }
   return value;
+}
+
+function parseAlgorithm(value: string): VerificationAlgorithm {
+  if (value === "RS256" || value === "ES256" || value === "EdDSA") {
+    return value;
+  }
+  throw new Error("algorithm must be one of RS256, ES256 or EdDSA");
 }
 
 function parseHttpsUrl(value: string, field: string): URL {
