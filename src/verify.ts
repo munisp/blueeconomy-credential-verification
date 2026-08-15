@@ -1,8 +1,9 @@
-import { createHash } from "node:crypto";
 import { readFile, rename, writeFile, mkdir } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import process from "node:process";
 import { createRemoteJWKSet, jwtVerify, type JWTPayload } from "jose";
+import { createHash } from "node:crypto";
+import { loadApprovedIssuerPolicy } from "./issuer-policy.js";
 
 export type VerificationAlgorithm = "RS256" | "ES256" | "EdDSA";
 
@@ -14,6 +15,7 @@ export interface VerificationConfiguration {
   algorithm: VerificationAlgorithm;
   evidencePath: string;
   requireJti: boolean;
+  issuerPolicyPath?: string;
 }
 
 export interface VerificationEvidence {
@@ -36,7 +38,7 @@ export function parseConfiguration(args: readonly string[]): VerificationConfigu
     const name = args[index];
     const value = args[index + 1];
     if (name === undefined || value === undefined || !name.startsWith("--")) {
-      throw new Error("usage: credential-verifier --credential <path> --issuer <https-url> --audience <value> --jwks-url <https-url> --algorithm <name> --evidence <path> [--require-jti <true|false>]");
+      throw new Error("usage: credential-verifier --credential <path> --issuer <https-url> --audience <value> --jwks-url <https-url> --algorithm <name> --evidence <path> [--require-jti <true|false>] [--issuer-policy <path>]");
     }
     if (values.has(name)) {
       throw new Error(`duplicate argument: ${name}`);
@@ -51,13 +53,17 @@ export function parseConfiguration(args: readonly string[]): VerificationConfigu
   const algorithm = parseAlgorithm(required(values, "--algorithm"));
   const evidencePath = resolve(required(values, "--evidence"));
   const requireJti = values.has("--require-jti") ? parseBoolean(required(values, "--require-jti"), "--require-jti") : false;
-  if (values.size !== (values.has("--require-jti") ? 7 : 6)) {
+  const issuerPolicyPath = values.has("--issuer-policy") ? resolve(required(values, "--issuer-policy")) : undefined;
+  const expectedSize = 6 + (values.has("--require-jti") ? 1 : 0) + (values.has("--issuer-policy") ? 1 : 0);
+  if (values.size !== expectedSize) {
     throw new Error("unexpected argument supplied");
   }
   if (credentialPath === evidencePath || credentialPath === `${evidencePath}.tmp`) {
     throw new Error("evidence path or staging path must not overwrite the credential input");
   }
-  return { credentialPath, issuer, audience, jwksUrl, algorithm, evidencePath, requireJti };
+  const configuration: VerificationConfiguration = { credentialPath, issuer, audience, jwksUrl, algorithm, evidencePath, requireJti };
+  if (issuerPolicyPath !== undefined) configuration.issuerPolicyPath = issuerPolicyPath;
+  return configuration;
 }
 
 export async function verifyCredential(configuration: VerificationConfiguration): Promise<VerificationEvidence> {
@@ -69,6 +75,9 @@ export async function verifyCredential(configuration: VerificationConfiguration)
     throw new Error("credential must be a compact signed JWT with three segments");
   }
 
+  if (configuration.issuerPolicyPath !== undefined) {
+    await loadApprovedIssuerPolicy(configuration.issuerPolicyPath, { issuer: configuration.issuer, audience: configuration.audience, jwksUrl: configuration.jwksUrl, algorithm: configuration.algorithm });
+  }
   const jwks = createRemoteJWKSet(configuration.jwksUrl, {
     timeoutDuration: 10_000,
     cooldownDuration: 5_000,
