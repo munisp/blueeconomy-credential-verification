@@ -38,6 +38,14 @@ export interface StatusRegistryConfiguration {
   keyId: string;
 }
 
+export interface VerifiedStatusRegistryConfiguration {
+  path: string;
+  issuer: string;
+  key: VerificationKey;
+  algorithm: "RS256" | "RS384" | "RS512";
+  keyId?: string;
+}
+
 export class StatusRegistry {
   private writeChain: Promise<void> = Promise.resolve();
   private readonly path: string;
@@ -47,7 +55,7 @@ export class StatusRegistry {
     if (configuration.issuer.trim() !== configuration.issuer || configuration.issuer.length === 0) {
       throw new Error("registry issuer must be canonical non-empty text");
     }
-    if (configuration.keyId.trim() !== configuration.keyId || configuration.keyId.length === 0) {
+    if (!isCanonicalKeyId(configuration.keyId)) {
       throw new Error("registry key id must be canonical non-empty text");
     }
   }
@@ -66,7 +74,7 @@ export class StatusRegistry {
 
     let result!: SignedStatusRecord;
     await this.enqueue(async () => {
-      const previous = await this.records();
+      const previous = await readStatusRecords(this.path);
       const claims: StatusRegistryClaims = {
         schema_version: "blueeconomy.credential.status.v1",
         sequence: previous.length + 1,
@@ -89,26 +97,13 @@ export class StatusRegistry {
 
   public async lookup(credentialId: string, verificationKey?: VerificationKey): Promise<StatusLookup> {
     const reference = digest(credentialId);
-    const records = await this.records();
+    const records = await readStatusRecords(this.path);
     const matches = records.filter((record) => record.claims.credential_id_reference_sha256 === reference);
     if (matches.length === 0) return { status: "UNKNOWN" };
     const latest = matches[matches.length - 1];
     if (latest === undefined) throw new Error("status registry match disappeared");
-    if (verificationKey !== undefined) await verifyStatusRecord(latest, verificationKey, this.configuration.algorithm);
+    if (verificationKey !== undefined) await verifyStatusRecord(latest, verificationKey, this.configuration.algorithm, this.configuration.keyId);
     return { status: latest.claims.status, claims: latest.claims, protected_jws: latest.protected_jws };
-  }
-
-  private async records(): Promise<SignedStatusRecord[]> {
-    try {
-      const content = await readFile(this.path, "utf8");
-      const lines = content.split("\n").filter((line) => line.length > 0);
-      const records = lines.map((line) => JSON.parse(line) as SignedStatusRecord);
-      validateSequence(records);
-      return records;
-    } catch (error) {
-      if (isMissingFile(error)) return [];
-      throw error;
-    }
   }
 
   private async enqueue(operation: () => Promise<void>): Promise<void> {
@@ -118,18 +113,76 @@ export class StatusRegistry {
   }
 }
 
-export async function verifyStatusRecord(record: SignedStatusRecord, key: VerificationKey, algorithm: StatusRegistryConfiguration["algorithm"]): Promise<StatusRegistryClaims> {
+/**
+ * Reads a registry without signing capability. Every record is verified before
+ * lookup, including unrelated records, to fail closed on chain corruption.
+ */
+export async function lookupVerifiedStatus(
+  credentialId: string,
+  configuration: VerifiedStatusRegistryConfiguration,
+  now = new Date(),
+): Promise<StatusLookup> {
+  if (credentialId.trim() !== credentialId || credentialId.length === 0) throw new Error("credential id must be canonical non-empty text");
+  if (configuration.issuer.trim() !== configuration.issuer || configuration.issuer.length === 0) throw new Error("registry issuer must be canonical non-empty text");
+  if (configuration.keyId !== undefined && !isCanonicalKeyId(configuration.keyId)) throw new Error("registry verification key id must be canonical non-empty text");
+  if (!Number.isFinite(now.getTime())) throw new Error("status evaluation time must be valid");
+
+  const records = await readStatusRecords(resolve(configuration.path));
+  const reference = digest(credentialId);
+  let latest: SignedStatusRecord | undefined;
+  for (const record of records) {
+    const claims = await verifyStatusRecord(record, configuration.key, configuration.algorithm, configuration.keyId);
+    if (claims.issuer !== configuration.issuer) throw new Error("status registry record issuer does not match configured issuer");
+    const effectiveAt = new Date(claims.effective_at);
+    if (!Number.isFinite(effectiveAt.getTime())) throw new Error("status registry effective_at is invalid");
+    if (claims.credential_id_reference_sha256 === reference && effectiveAt <= now) latest = record;
+  }
+  if (latest === undefined) return { status: "UNKNOWN" };
+  return { status: latest.claims.status, claims: latest.claims, protected_jws: latest.protected_jws };
+}
+
+export async function verifyStatusRecord(
+  record: SignedStatusRecord,
+  key: VerificationKey,
+  algorithm: StatusRegistryConfiguration["algorithm"],
+  expectedKeyId?: string,
+): Promise<StatusRegistryClaims> {
   const verified = await compactVerify(record.protected_jws, key, { algorithms: [algorithm] });
+  if (expectedKeyId !== undefined && verified.protectedHeader.kid !== expectedKeyId) {
+    throw new Error("status record protected-header kid does not match approved verification key");
+  }
   const claims = JSON.parse(new TextDecoder().decode(verified.payload)) as StatusRegistryClaims;
   if (JSON.stringify(claims) !== JSON.stringify(record.claims)) throw new Error("status record claims do not match signed payload");
   if (claims.schema_version !== "blueeconomy.credential.status.v1") throw new Error("unsupported status record schema");
+  if (!isCredentialStatus(claims.status)) throw new Error("unsupported credential status");
   return claims;
+}
+
+async function readStatusRecords(path: string): Promise<SignedStatusRecord[]> {
+  try {
+    const content = await readFile(path, "utf8");
+    const lines = content.split("\n").filter((line) => line.length > 0);
+    const records = lines.map((line) => JSON.parse(line) as SignedStatusRecord);
+    validateSequence(records);
+    return records;
+  } catch (error) {
+    if (isMissingFile(error)) return [];
+    throw error;
+  }
 }
 
 function validateSequence(records: readonly SignedStatusRecord[]): void {
   records.forEach((record, index) => {
     if (record.claims.sequence !== index + 1) throw new Error("status registry sequence is not contiguous");
   });
+}
+
+function isCredentialStatus(value: unknown): value is CredentialStatus {
+  return value === "ACTIVE" || value === "SUSPENDED" || value === "REVOKED";
+}
+
+function isCanonicalKeyId(value: string): boolean {
+  return /^[A-Za-z0-9._:-]{1,128}$/.test(value);
 }
 
 function digest(value: string): string {

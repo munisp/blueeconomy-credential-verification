@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { generateKeyPair } from "jose";
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { StatusRegistry, verifyStatusRecord } from "../src/status-registry.js";
+import { StatusRegistry, lookupVerifiedStatus, verifyStatusRecord } from "../src/status-registry.js";
 
 test("status registry persists signed lifecycle and returns latest status", async () => {
   const { privateKey, publicKey } = await generateKeyPair("RS256");
@@ -13,11 +13,19 @@ test("status registry persists signed lifecycle and returns latest status", asyn
 
   assert.equal((await registry.lookup("jti-unknown", publicKey)).status, "UNKNOWN");
   const active = await registry.setStatus("jti-001", "ACTIVE", "issued", "issuer-operator");
+  const activeLookup = await lookupVerifiedStatus("jti-001", { path: join(directory, "status.jsonl"), issuer: "https://issuer.example.test", key: publicKey, algorithm: "RS256", keyId: "key-2026-01" });
+  assert.equal(activeLookup.status, "ACTIVE");
   const revoked = await registry.setStatus("jti-001", "REVOKED", "credential compromised", "revocation-officer");
   assert.equal(active.claims.sequence, 1);
   assert.equal(revoked.claims.sequence, 2);
   assert.equal((await registry.lookup("jti-001", publicKey)).status, "REVOKED");
-  assert.equal((await verifyStatusRecord(revoked, publicKey, "RS256")).status, "REVOKED");
+  const revokedLookup = await lookupVerifiedStatus("jti-001", { path: join(directory, "status.jsonl"), issuer: "https://issuer.example.test", key: publicKey, algorithm: "RS256", keyId: "key-2026-01" });
+  assert.equal(revokedLookup.status, "REVOKED");
+  await assert.rejects(
+    () => lookupVerifiedStatus("jti-001", { path: join(directory, "status.jsonl"), issuer: "https://issuer.example.test", key: publicKey, algorithm: "RS256", keyId: "wrong-key" }),
+    /kid does not match/,
+  );
+  assert.equal((await verifyStatusRecord(revoked, publicKey, "RS256", "key-2026-01")).status, "REVOKED");
 });
 
 test("status registry rejects modified signed records and non-contiguous sequences", async () => {
@@ -30,4 +38,8 @@ test("status registry rejects modified signed records and non-contiguous sequenc
   const content = await readFile(path, "utf8");
   await writeFile(path, `${content}${JSON.stringify({ ...record, claims: { ...record.claims, sequence: 3 } })}\n`);
   await assert.rejects(() => registry.lookup("jti-002", publicKey), /sequence is not contiguous/);
+  await assert.rejects(
+    () => lookupVerifiedStatus("jti-002", { path, issuer: "https://issuer.example.test", key: publicKey, algorithm: "RS256", keyId: "key-2026-01" }),
+    /sequence is not contiguous/,
+  );
 });

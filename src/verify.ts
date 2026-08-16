@@ -1,11 +1,19 @@
 import { readFile, rename, writeFile, mkdir } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import process from "node:process";
-import { createRemoteJWKSet, decodeProtectedHeader, jwtVerify, type JWTPayload } from "jose";
+import { createRemoteJWKSet, decodeProtectedHeader, importSPKI, jwtVerify, type JWTPayload } from "jose";
 import { createHash } from "node:crypto";
 import { assertApprovedIssuerKeyId, type ApprovedIssuerPolicy, loadApprovedIssuerPolicy } from "./issuer-policy.js";
+import { lookupVerifiedStatus, type CredentialStatus } from "./status-registry.js";
 
 export type VerificationAlgorithm = "RS256" | "ES256" | "EdDSA";
+
+export interface StatusVerificationConfiguration {
+  registryPath: string;
+  verificationKeyPath: string;
+  algorithm: "RS256" | "RS384" | "RS512";
+  keyId: string;
+}
 
 export interface VerificationConfiguration {
   credentialPath: string;
@@ -16,6 +24,7 @@ export interface VerificationConfiguration {
   evidencePath: string;
   requireJti: boolean;
   issuerPolicyPath?: string;
+  statusVerification?: StatusVerificationConfiguration;
 }
 
 export interface VerificationEvidence {
@@ -30,6 +39,7 @@ export interface VerificationEvidence {
   expires_at?: string;
   key_id?: string;
   credential_id_reference_sha256?: string;
+  credential_status?: CredentialStatus;
 }
 
 export function parseConfiguration(args: readonly string[]): VerificationConfiguration {
@@ -38,7 +48,7 @@ export function parseConfiguration(args: readonly string[]): VerificationConfigu
     const name = args[index];
     const value = args[index + 1];
     if (name === undefined || value === undefined || !name.startsWith("--")) {
-      throw new Error("usage: credential-verifier --credential <path> --issuer <https-url> --audience <value> --jwks-url <https-url> --algorithm <name> --evidence <path> [--require-jti <true|false>] [--issuer-policy <path>]");
+      throw new Error("usage: credential-verifier --credential <path> --issuer <https-url> --audience <value> --jwks-url <https-url> --algorithm <name> --evidence <path> [--require-jti <true|false>] [--issuer-policy <path>] [--status-registry <path> --status-verification-key <pem-path> --status-algorithm <name> --status-kid <id>]");
     }
     if (values.has(name)) {
       throw new Error(`duplicate argument: ${name}`);
@@ -54,7 +64,18 @@ export function parseConfiguration(args: readonly string[]): VerificationConfigu
   const evidencePath = resolve(required(values, "--evidence"));
   const requireJti = values.has("--require-jti") ? parseBoolean(required(values, "--require-jti"), "--require-jti") : false;
   const issuerPolicyPath = values.has("--issuer-policy") ? resolve(required(values, "--issuer-policy")) : undefined;
-  const expectedSize = 6 + (values.has("--require-jti") ? 1 : 0) + (values.has("--issuer-policy") ? 1 : 0);
+  const statusNames = ["--status-registry", "--status-verification-key", "--status-algorithm", "--status-kid"] as const;
+  const configuredStatusCount = statusNames.filter((name) => values.has(name)).length;
+  if (configuredStatusCount !== 0 && configuredStatusCount !== statusNames.length) {
+    throw new Error("status verification requires --status-registry, --status-verification-key, --status-algorithm and --status-kid together");
+  }
+  const statusVerification = configuredStatusCount === 0 ? undefined : {
+    registryPath: resolve(required(values, "--status-registry")),
+    verificationKeyPath: resolve(required(values, "--status-verification-key")),
+    algorithm: parseStatusAlgorithm(required(values, "--status-algorithm")),
+    keyId: parseCanonicalKeyId(required(values, "--status-kid"), "--status-kid"),
+  };
+  const expectedSize = 6 + (values.has("--require-jti") ? 1 : 0) + (values.has("--issuer-policy") ? 1 : 0) + configuredStatusCount;
   if (values.size !== expectedSize) {
     throw new Error("unexpected argument supplied");
   }
@@ -63,6 +84,7 @@ export function parseConfiguration(args: readonly string[]): VerificationConfigu
   }
   const configuration: VerificationConfiguration = { credentialPath, issuer, audience, jwksUrl, algorithm, evidencePath, requireJti };
   if (issuerPolicyPath !== undefined) configuration.issuerPolicyPath = issuerPolicyPath;
+  if (statusVerification !== undefined) configuration.statusVerification = statusVerification;
   return configuration;
 }
 
@@ -94,7 +116,8 @@ export async function verifyCredential(configuration: VerificationConfiguration)
     algorithms: [configuration.algorithm],
     clockTolerance: 5,
   });
-  return createEvidence(configuration, compactJwt,     verified.protectedHeader.kid, verified.payload);
+  const credentialStatus = await verifyCredentialStatus(configuration, verified.payload);
+  return createEvidence(configuration, compactJwt, verified.protectedHeader.kid, verified.payload, credentialStatus);
 }
 
 /**
@@ -130,6 +153,7 @@ function createEvidence(
   compactJwt: string,
   keyId: string | undefined,
   payload: JWTPayload,
+  credentialStatus?: CredentialStatus,
 ): VerificationEvidence {
   const evidence: VerificationEvidence = {
     schema_version: "blueeconomy.credential.verification.v1",
@@ -159,6 +183,9 @@ function createEvidence(
   if (keyId !== undefined && keyId.length > 0) {
     evidence.key_id = keyId;
   }
+  if (credentialStatus !== undefined) {
+    evidence.credential_status = credentialStatus;
+  }
   return evidence;
 }
 
@@ -176,11 +203,47 @@ function parseBoolean(value: string, field: string): boolean {
   throw new Error(`${field} must be true or false`);
 }
 
+async function verifyCredentialStatus(
+  configuration: VerificationConfiguration,
+  payload: JWTPayload,
+): Promise<CredentialStatus | undefined> {
+  if (configuration.statusVerification === undefined) return undefined;
+  if (typeof payload.jti !== "string" || payload.jti.length === 0) {
+    throw new Error("credential jti is required for signed status verification");
+  }
+  const status = configuration.statusVerification;
+  const pem = await readFile(status.verificationKeyPath, "utf8");
+  const verificationKey = await importSPKI(pem, status.algorithm);
+  const result = await lookupVerifiedStatus(payload.jti, {
+    path: status.registryPath,
+    issuer: configuration.issuer,
+    key: verificationKey,
+    algorithm: status.algorithm,
+    keyId: status.keyId,
+  });
+  if (result.status !== "ACTIVE") {
+    throw new Error(`credential status must be ACTIVE, got ${result.status}`);
+  }
+  return result.status;
+}
+
 function parseAlgorithm(value: string): VerificationAlgorithm {
   if (value === "RS256" || value === "ES256" || value === "EdDSA") {
     return value;
   }
   throw new Error("algorithm must be one of RS256, ES256 or EdDSA");
+}
+
+function parseStatusAlgorithm(value: string): "RS256" | "RS384" | "RS512" {
+  if (value === "RS256" || value === "RS384" || value === "RS512") return value;
+  throw new Error("--status-algorithm must be one of RS256, RS384 or RS512");
+}
+
+function parseCanonicalKeyId(value: string, field: string): string {
+  if (!/^[A-Za-z0-9._:-]{1,128}$/.test(value)) {
+    throw new Error(`${field} must be a canonical key identifier`);
+  }
+  return value;
 }
 
 function parseHttpsUrl(value: string, field: string): URL {
