@@ -1,9 +1,9 @@
 import { readFile, rename, writeFile, mkdir } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import process from "node:process";
-import { createRemoteJWKSet, jwtVerify, type JWTPayload } from "jose";
+import { createRemoteJWKSet, decodeProtectedHeader, jwtVerify, type JWTPayload } from "jose";
 import { createHash } from "node:crypto";
-import { loadApprovedIssuerPolicy } from "./issuer-policy.js";
+import { assertApprovedIssuerKeyId, type ApprovedIssuerPolicy, loadApprovedIssuerPolicy } from "./issuer-policy.js";
 
 export type VerificationAlgorithm = "RS256" | "ES256" | "EdDSA";
 
@@ -75,9 +75,15 @@ export async function verifyCredential(configuration: VerificationConfiguration)
     throw new Error("credential must be a compact signed JWT with three segments");
   }
 
-  if (configuration.issuerPolicyPath !== undefined) {
-    await loadApprovedIssuerPolicy(configuration.issuerPolicyPath, { issuer: configuration.issuer, audience: configuration.audience, jwksUrl: configuration.jwksUrl, algorithm: configuration.algorithm });
-  }
+  const issuerPolicy = configuration.issuerPolicyPath === undefined
+    ? undefined
+    : await loadApprovedIssuerPolicy(configuration.issuerPolicyPath, {
+      issuer: configuration.issuer,
+      audience: configuration.audience,
+      jwksUrl: configuration.jwksUrl,
+      algorithm: configuration.algorithm,
+    });
+  assertCredentialProtectedHeader(compactJwt, configuration.algorithm, issuerPolicy);
   const jwks = createRemoteJWKSet(configuration.jwksUrl, {
     timeoutDuration: 10_000,
     cooldownDuration: 5_000,
@@ -89,6 +95,26 @@ export async function verifyCredential(configuration: VerificationConfiguration)
     clockTolerance: 5,
   });
   return createEvidence(configuration, compactJwt,     verified.protectedHeader.kid, verified.payload);
+}
+
+/**
+ * Verifies the signed-JWT protected header against the configured algorithm
+ * and the issuer manifest's pinned KID allowlist before remote JWKS selection.
+ */
+export function assertCredentialProtectedHeader(
+  compactJwt: string,
+  algorithm: VerificationAlgorithm,
+  issuerPolicy?: ApprovedIssuerPolicy,
+): string | undefined {
+  const protectedHeader = decodeProtectedHeader(compactJwt);
+  if (protectedHeader.alg !== algorithm) {
+    throw new Error("credential protected-header algorithm does not match configured algorithm");
+  }
+  const keyId = typeof protectedHeader.kid === "string" ? protectedHeader.kid : undefined;
+  if (issuerPolicy !== undefined) {
+    assertApprovedIssuerKeyId(issuerPolicy, keyId);
+  }
+  return keyId;
 }
 
 export async function writeEvidence(path: string, evidence: VerificationEvidence): Promise<void> {
