@@ -214,13 +214,21 @@ async function verifyCredentialStatus(
   const status = configuration.statusVerification;
   const pem = await readFile(status.verificationKeyPath, "utf8");
   const verificationKey = await importSPKI(pem, status.algorithm);
-  const result = await lookupVerifiedStatus(payload.jti, {
-    path: status.registryPath,
-    issuer: configuration.issuer,
-    key: verificationKey,
-    algorithm: status.algorithm,
-    keyId: status.keyId,
-  });
+  let result: Awaited<ReturnType<typeof lookupVerifiedStatus>>;
+  try {
+    result = await lookupVerifiedStatus(payload.jti, {
+      path: status.registryPath,
+      issuer: configuration.issuer,
+      key: verificationKey,
+      algorithm: status.algorithm,
+      keyId: status.keyId,
+    });
+  } catch (error) {
+    // Status enforcement is fail-closed: unavailable, unreadable or
+    // cryptographically invalid status evidence may never imply ACTIVE.
+    const detail = error instanceof Error ? error.message : "unknown failure";
+    throw new Error(`credential status evidence unavailable: ${detail}`);
+  }
   if (result.status !== "ACTIVE") {
     throw new Error(`credential status must be ACTIVE, got ${result.status}`);
   }
