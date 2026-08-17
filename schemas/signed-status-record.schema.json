@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://contracts.blueeconomy.local/s4/signed-status-record.schema.json",
+  "title": "S4 Signed Credential Status Record",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["sequence", "issuer", "jti_sha256", "status", "effective_at", "updated_by", "signature"],
+  "properties": {
+    "sequence": {"type": "integer", "minimum": 1},
+    "issuer": {"type": "string", "format": "uri", "pattern": "^https://"},
+    "jti_sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "status": {"enum": ["ACTIVE", "SUSPENDED", "REVOKED"]},
+    "effective_at": {"type": "string", "format": "date-time"},
+    "updated_by": {"type": "string", "minLength": 1, "maxLength": 256},
+    "reason": {"type": "string", "maxLength": 1024},
+    "signature": {"type": "string", "minLength": 1, "description": "Compact JWS over canonical record claims."}
+  }
+}
