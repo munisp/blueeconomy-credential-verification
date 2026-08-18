@@ -1,0 +1,13 @@
+import assert from "node:assert/strict";
+import { assertTenantBoundRecord, tenantKafkaTopic, tenantObjectPath } from "../src/tenant-data-plane.js";
+const tenantA = "tenant-ministry-a";
+const tenantB = "tenant-ministry-b";
+assert.equal(tenantKafkaTopic(tenantA, "s1.port-calls"), "blueeconomy.tenant-ministry-a.s1.port-calls");
+console.log("ASSERT tenant-specific Kafka topic derivation: passed");
+assert.equal(tenantObjectPath(tenantA, "evidence", "doc-001"), "tenants/tenant-ministry-a/evidence/doc-001");
+console.log("ASSERT tenant-specific object path derivation: passed");
+assert.throws(() => assertTenantBoundRecord(tenantA, tenantB), /cross-tenant record access denied/);
+console.log("ASSERT cross-tenant Kafka/object record request rejected before transport: passed");
+assert.throws(() => tenantObjectPath(tenantA, "evidence", "../../tenant-ministry-b/secret"), /invalid tenant object path segment/);
+console.log("ASSERT object traversal/cross-tenant path injection rejected: passed");
+console.log("TENANT_DATA_PLANE_CONTRACT_HARNESS_PASSED");
