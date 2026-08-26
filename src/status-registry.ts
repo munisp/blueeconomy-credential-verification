@@ -52,8 +52,8 @@ export class StatusRegistry {
 
   public constructor(private readonly configuration: StatusRegistryConfiguration) {
     this.path = resolve(configuration.path);
-    if (configuration.issuer.trim() !== configuration.issuer || configuration.issuer.length === 0) {
-      throw new Error("registry issuer must be canonical non-empty text");
+    if (!isCanonicalIssuer(configuration.issuer)) {
+      throw new Error("registry issuer must be canonical HTTPS URI");
     }
     if (!isCanonicalKeyId(configuration.keyId)) {
       throw new Error("registry key id must be canonical non-empty text");
@@ -123,7 +123,7 @@ export async function lookupVerifiedStatus(
   now = new Date(),
 ): Promise<StatusLookup> {
   if (credentialId.trim() !== credentialId || credentialId.length === 0) throw new Error("credential id must be canonical non-empty text");
-  if (configuration.issuer.trim() !== configuration.issuer || configuration.issuer.length === 0) throw new Error("registry issuer must be canonical non-empty text");
+  if (!isCanonicalIssuer(configuration.issuer)) throw new Error("registry issuer must be canonical HTTPS URI");
   if (configuration.keyId !== undefined && !isCanonicalKeyId(configuration.keyId)) throw new Error("registry verification key id must be canonical non-empty text");
   if (!Number.isFinite(now.getTime())) throw new Error("status evaluation time must be valid");
 
@@ -153,8 +153,7 @@ export async function verifyStatusRecord(
   }
   const claims = JSON.parse(new TextDecoder().decode(verified.payload)) as StatusRegistryClaims;
   if (JSON.stringify(claims) !== JSON.stringify(record.claims)) throw new Error("status record claims do not match signed payload");
-  if (claims.schema_version !== "blueeconomy.credential.status.v1") throw new Error("unsupported status record schema");
-  if (!isCredentialStatus(claims.status)) throw new Error("unsupported credential status");
+  assertStatusRecordContract(record);
   return claims;
 }
 
@@ -173,6 +172,7 @@ async function readStatusRecords(path: string): Promise<SignedStatusRecord[]> {
 
 function validateSequence(records: readonly SignedStatusRecord[]): void {
   records.forEach((record, index) => {
+    assertStatusRecordContract(record);
     if (record.claims.sequence !== index + 1) throw new Error("status registry sequence is not contiguous");
   });
 }
@@ -181,8 +181,39 @@ function isCredentialStatus(value: unknown): value is CredentialStatus {
   return value === "ACTIVE" || value === "SUSPENDED" || value === "REVOKED";
 }
 
+/**
+ * Enforces the source-of-truth signed-status wire contract represented by
+ * schemas/signed-status-record.schema.json. Calling this at persistence and
+ * verification boundaries prevents the schema from becoming documentation-only.
+ */
+export function assertStatusRecordContract(record: SignedStatusRecord): void {
+  if (typeof record.protected_jws !== "string" || record.protected_jws.length === 0) {
+    throw new Error("status record protected_jws is required");
+  }
+  const claims = record.claims;
+  if (claims.schema_version !== "blueeconomy.credential.status.v1") throw new Error("unsupported status record schema");
+  if (!Number.isSafeInteger(claims.sequence) || claims.sequence < 1) throw new Error("status record sequence must be a positive integer");
+  if (!/^[0-9a-f]{64}$/.test(claims.credential_id_reference_sha256)) throw new Error("status record credential reference must be a SHA-256 digest");
+  if (!isCredentialStatus(claims.status)) throw new Error("unsupported credential status");
+  if (claims.reason.trim() !== claims.reason || claims.reason.length === 0 || claims.reason.length > 512) throw new Error("status record reason must be canonical text of 1-512 characters");
+  if (claims.updated_by.trim() !== claims.updated_by || claims.updated_by.length === 0 || claims.updated_by.length > 256) throw new Error("status record updated_by must be canonical text of 1-256 characters");
+  if (!isCanonicalIssuer(claims.issuer)) throw new Error("status record issuer must be canonical HTTPS URI");
+  const effectiveAt = new Date(claims.effective_at);
+  if (!Number.isFinite(effectiveAt.getTime()) || effectiveAt.toISOString() !== claims.effective_at) throw new Error("status record effective_at must be canonical ISO-8601 time");
+}
+
 function isCanonicalKeyId(value: string): boolean {
   return /^[A-Za-z0-9._:-]{1,128}$/.test(value);
+}
+
+function isCanonicalIssuer(value: string): boolean {
+  if (value.trim() !== value || value.length === 0) return false;
+  try {
+    const parsed = new URL(value);
+    return parsed.protocol === "https:" && parsed.toString().replace(/\/$/, "") === value.replace(/\/$/, "");
+  } catch {
+    return false;
+  }
 }
 
 function digest(value: string): string {

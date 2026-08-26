@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { generateKeyPair } from "jose";
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { StatusRegistry, lookupVerifiedStatus, verifyStatusRecord } from "../src/status-registry.js";
+import { assertStatusRecordContract, StatusRegistry, lookupVerifiedStatus, verifyStatusRecord } from "../src/status-registry.js";
 
 test("status registry persists signed lifecycle and returns latest status", async () => {
   const { privateKey, publicKey } = await generateKeyPair("RS256");
@@ -13,6 +13,8 @@ test("status registry persists signed lifecycle and returns latest status", asyn
 
   assert.equal((await registry.lookup("jti-unknown", publicKey)).status, "UNKNOWN");
   const active = await registry.setStatus("jti-001", "ACTIVE", "issued", "issuer-operator");
+  assert.doesNotThrow(() => assertStatusRecordContract(active));
+  assert.equal(active.claims.credential_id_reference_sha256.length, 64);
   const activeLookup = await lookupVerifiedStatus("jti-001", { path: join(directory, "status.jsonl"), issuer: "https://issuer.example.test", key: publicKey, algorithm: "RS256", keyId: "key-2026-01" });
   assert.equal(activeLookup.status, "ACTIVE");
   const revoked = await registry.setStatus("jti-001", "REVOKED", "credential compromised", "revocation-officer");
@@ -26,6 +28,18 @@ test("status registry persists signed lifecycle and returns latest status", asyn
     /kid does not match/,
   );
   assert.equal((await verifyStatusRecord(revoked, publicKey, "RS256", "key-2026-01")).status, "REVOKED");
+});
+
+test("signed status schema declares the exact emitted record envelope", async () => {
+  const schemaPath = new URL("../schemas/signed-status-record.schema.json", import.meta.url);
+  const schema = JSON.parse(await readFile(schemaPath, "utf8")) as Record<string, unknown>;
+  assert.deepEqual(schema.required, ["protected_jws", "claims"]);
+  const properties = schema.properties as Record<string, unknown>;
+  assert.equal((properties.protected_jws as Record<string, unknown>).type, "string");
+  const claims = properties.claims as Record<string, unknown>;
+  const claimProperties = claims.properties as Record<string, unknown>;
+  assert.equal((claimProperties.schema_version as Record<string, unknown>).const, "blueeconomy.credential.status.v1");
+  assert.deepEqual((claimProperties.status as Record<string, unknown>).enum, ["ACTIVE", "SUSPENDED", "REVOKED"]);
 });
 
 test("status registry rejects modified signed records and non-contiguous sequences", async () => {
