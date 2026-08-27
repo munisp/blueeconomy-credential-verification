@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://contracts.blueeconomy.local/seafarer/seafarer-coc-subject.schema.json",
+  "title": "Seafarer Certificate of Competency Credential Subject",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "id",
+    "type",
+    "seafarerReferenceNumber",
+    "capacity",
+    "stcwRegulation",
+    "limitations"
+  ],
+  "properties": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "description": "Holder binding identifier (DID or platform subject)."
+    },
+    "type": {
+      "const": "Seafarer"
+    },
+    "seafarerReferenceNumber": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64
+    },
+    "capacity": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "description": "STCW capacity, e.g. 'Master on ships of 500 GT or more'."
+    },
+    "stcwRegulation": {
+      "type": "string",
+      "pattern": "^STCW (regulation )?[A-Za-z]+(-[A-Za-z]+)?/[0-9]+(\\.[0-9]+)?( paragraph [0-9]+)?$"
+    },
+    "limitations": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 256
+      }
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "nationality": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64
+    }
+  }
+}

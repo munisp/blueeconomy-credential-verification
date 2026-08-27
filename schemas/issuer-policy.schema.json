@@ -4,13 +4,56 @@
   "title": "S4 Approved Issuer Policy",
   "type": "object",
   "additionalProperties": false,
-  "required": ["issuer", "audience", "jwks_url", "algorithms", "active"],
+  "required": [
+    "schema_version",
+    "issuer",
+    "audience",
+    "jwks_url",
+    "algorithms",
+    "active"
+  ],
   "properties": {
-    "issuer": {"type": "string", "format": "uri", "pattern": "^https://"},
-    "audience": {"type": "string", "minLength": 1, "maxLength": 256},
-    "jwks_url": {"type": "string", "format": "uri", "pattern": "^https://"},
-    "algorithms": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"enum": ["RS256", "ES256", "EdDSA"]}},
-    "key_ids": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "pattern": "^[A-Za-z0-9._:-]{1,256}$"}},
-    "active": {"type": "boolean"}
+    "schema_version": {
+      "const": "blueeconomy.credential.issuer-policy.v1"
+    },
+    "issuer": {
+      "type": "string",
+      "format": "uri",
+      "pattern": "^https://"
+    },
+    "audience": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "jwks_url": {
+      "type": "string",
+      "format": "uri",
+      "pattern": "^https://"
+    },
+    "algorithms": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "RS256",
+          "ES256",
+          "EdDSA"
+        ]
+      }
+    },
+    "key_ids": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "pattern": "^[A-Za-z0-9._:-]{1,128}$"
+      }
+    },
+    "active": {
+      "type": "boolean"
+    }
   }
 }

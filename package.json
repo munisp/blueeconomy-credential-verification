@@ -9,14 +9,26 @@
   },
   "scripts": {
     "build": "tsc --noEmit",
+    "compile": "tsc -p tsconfig.build.json",
+    "schemas:generate": "tsx scripts/generate-schemas.ts",
+    "start": "node dist/main.js",
     "test": "node --test --import tsx tests/**/*.test.ts",
     "verify": "npm run build && npm test"
   },
   "dependencies": {
-    "jose": "6.2.8"
+    "@temporalio/activity": "1.23.0",
+    "@temporalio/client": "1.23.0",
+    "@temporalio/worker": "1.23.0",
+    "@temporalio/workflow": "1.23.0",
+    "jose": "6.2.8",
+    "kafkajs": "2.2.4",
+    "pg": "8.23.0",
+    "tigerbeetle-node": "0.17.9"
   },
   "devDependencies": {
+    "@temporalio/testing": "1.23.0",
     "@types/node": "26.2.0",
+    "@types/pg": "8.23.1",
     "tsx": "4.23.12",
     "typescript": "7.0.2"
   }

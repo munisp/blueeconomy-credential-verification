@@ -1,0 +1,237 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import { mkdtemp } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type { AddressInfo } from "node:net";
+import { SignJWT, createLocalJWKSet, exportJWK, generateKeyPair } from "jose";
+
+import { KeycloakAuthenticator, authorizeRequest, AuthorizationError, ROLE_AUDITOR, ROLE_EMPLOYER, ROLE_NIMASA_APPROVER, ROLE_PSC_INSPECTOR, type PrincipalRole } from "../src/auth/keycloak.js";
+import { createHttpService } from "../src/http/server.js";
+import { CredentialService } from "../src/service/credential-service.js";
+import { createJsonlTestStatusStore } from "../src/status/jsonl-test-store.js";
+import { generateEphemeralIssuerKeyPair } from "../src/vc/issuer.js";
+import type { EligibilityGate } from "../src/temporal/eligibility-gate.js";
+import type { IssuanceLedger } from "../src/ledger/issuance-ledger.js";
+import type { StatusStore } from "../src/status/store.js";
+
+const ISSUER_DID = "did:web:credentials.nimasa.gov.ng";
+const OIDC_ISSUER = "https://keycloak.blueeconomy.example/realms/blueeconomy";
+const OIDC_AUDIENCE = "credential-verification";
+
+interface Harness {
+  baseUrl: string;
+  close(): Promise<void>;
+  token(roles: PrincipalRole[]): Promise<string>;
+}
+
+async function startHarness(): Promise<Harness> {
+  const { privateKey: oidcKey, publicKey: oidcPublic } = await generateKeyPair("RS256");
+  const jwk = await exportJWK(oidcPublic);
+  jwk.kid = "keycloak-test-key";
+  jwk.alg = "RS256";
+  jwk.use = "sig";
+  const authenticator = new KeycloakAuthenticator({
+    issuer: OIDC_ISSUER,
+    audience: OIDC_AUDIENCE,
+    roleClientIds: ["credential-api"],
+    getKey: createLocalJWKSet({ keys: [jwk] }),
+  });
+
+  const directory = await mkdtemp(join(tmpdir(), "blueeconomy-http-"));
+  const statusStore: StatusStore = createJsonlTestStatusStore(join(directory, "status.jsonl"), {
+    BLUEECONOMY_STATUS_JSONL_TEST_PATH: join(directory, "status.jsonl"),
+    BLUEECONOMY_STATUS_ISSUER: ISSUER_DID,
+  });
+  const { privateKey: issuerKey } = generateEphemeralIssuerKeyPair();
+  const ledger: IssuanceLedger = {
+    async record(entry) {
+      return {
+        transferIdHex: "ab".repeat(16),
+        commitHash: "c".repeat(64),
+        idempotentReplay: false,
+      };
+    },
+    async healthCheck() {},
+    async close() {},
+  };
+  const eligibilityGate: EligibilityGate = {
+    async check(workflowId, seafarerId) {
+      return {
+        eligible: workflowId === "wf-eligible" && seafarerId === "seafarer-ng-0001",
+        observation: {
+          seafarerId,
+          correlationId: "corr-0001",
+          stage: workflowId === "wf-eligible" ? "ELIGIBLE" : "AWAITING_EXAM_RESULT",
+          slaBreachedStages: [],
+        },
+      };
+    },
+  };
+  let nextIndex = 0;
+  const service = new CredentialService({
+    issuer: {
+      issuerDid: ISSUER_DID,
+      verificationMethod: `${ISSUER_DID}#ed25519-key-1`,
+      privateKey: issuerKey,
+      statusListCredentialUrl: "https://credentials.nimasa.gov.ng/v1/status-list/main",
+    },
+    statusStore,
+    ledger,
+    eligibilityGate,
+    producer: "blueeconomy-credential-verification",
+    statusListId: "https://credentials.nimasa.gov.ng/v1/status-list/main",
+    allocateStatusListIndex: () => nextIndex++,
+  });
+
+  const { server } = createHttpService({ authenticator, service, statusStore });
+  await new Promise<void>((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));
+  const address = server.address() as AddressInfo;
+  return {
+    baseUrl: `http://127.0.0.1:${address.port}`,
+    async close() {
+      await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
+      await statusStore.close();
+    },
+    async token(roles: PrincipalRole[]) {
+      return new SignJWT({ realm_access: { roles } })
+        .setProtectedHeader({ alg: "RS256", kid: "keycloak-test-key" })
+        .setIssuer(OIDC_ISSUER)
+        .setAudience(OIDC_AUDIENCE)
+        .setSubject("principal-01")
+        .setIssuedAt()
+        .setExpirationTime("5m")
+        .sign(oidcKey);
+    },
+  };
+}
+
+const ISSUE_BODY = {
+  workflowId: "wf-eligible",
+  seafarerId: "seafarer-ng-0001",
+  holderId: "did:web:wallet.seafarer.example:ng-0001",
+  seafarerReferenceNumber: "NG-SRN-0001",
+  capacity: "Officer in charge of a navigational watch",
+  stcwRegulation: "STCW regulation II/1",
+  limitations: [],
+  validUntil: "2031-01-01T00:00:00.000Z",
+};
+
+async function post(baseUrl: string, path: string, body: unknown, token?: string) {
+  const response = await fetch(`${baseUrl}${path}`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      ...(token !== undefined ? { authorization: `Bearer ${token}` } : {}),
+    },
+    body: JSON.stringify(body),
+  });
+  return { status: response.status, body: await response.json() as Record<string, unknown> };
+}
+
+async function get(baseUrl: string, path: string, token?: string) {
+  const response = await fetch(`${baseUrl}${path}`, {
+    headers: token !== undefined ? { authorization: `Bearer ${token}` } : {},
+  });
+  const contentType = response.headers.get("content-type") ?? "";
+  const body = contentType.includes("application/json") ? await response.json() : await response.text();
+  return { status: response.status, body: body as Record<string, unknown> };
+}
+
+test("issuer and verifier HTTP surface with role matrix", async (t) => {
+  const harness = await startHarness();
+  t.after(() => harness.close());
+
+  await t.test("healthz and readyz are unauthenticated", async () => {
+    assert.equal((await get(harness.baseUrl, "/healthz")).status, 200);
+    assert.equal((await get(harness.baseUrl, "/readyz")).status, 200);
+    const metrics = await get(harness.baseUrl, "/metrics");
+    assert.equal(metrics.status, 200);
+  });
+
+  await t.test("requests without a token are rejected", async () => {
+    assert.equal((await post(harness.baseUrl, "/v1/credentials", ISSUE_BODY)).status, 401);
+    assert.equal((await post(harness.baseUrl, "/v1/verify", {})).status, 401);
+    assert.equal((await get(harness.baseUrl, "/v1/status-list/main")).status, 401);
+  });
+
+  await t.test("unknown routes are denied by default", async () => {
+    const token = await harness.token([ROLE_NIMASA_APPROVER]);
+    assert.equal((await post(harness.baseUrl, "/v1/admin", {}, token)).status, 404);
+  });
+
+  await t.test("employer and psc-inspector cannot issue", async () => {
+    for (const role of [ROLE_EMPLOYER, ROLE_PSC_INSPECTOR] as const) {
+      const token = await harness.token([role]);
+      assert.equal((await post(harness.baseUrl, "/v1/credentials", ISSUE_BODY, token)).status, 403);
+    }
+  });
+
+  await t.test("auditor is read-only and denied every mutation", async () => {
+    const token = await harness.token([ROLE_AUDITOR]);
+    assert.equal((await post(harness.baseUrl, "/v1/credentials", ISSUE_BODY, token)).status, 403);
+    assert.equal((await post(harness.baseUrl, "/v1/revoke", { credentialId: "x", holderId: "y", reason: "z" }, token)).status, 403);
+  });
+
+  await t.test("token without approved roles is denied", async () => {
+    const token = await harness.token([]);
+    assert.equal((await get(harness.baseUrl, "/v1/status-list/main", token)).status, 403);
+  });
+
+  let issuedCredential: unknown;
+  let issuedCredentialId = "";
+
+  await t.test("nimasa-approver issues a gated credential", async () => {
+    const token = await harness.token([ROLE_NIMASA_APPROVER]);
+    const blocked = await post(harness.baseUrl, "/v1/credentials", { ...ISSUE_BODY, workflowId: "wf-not-eligible" }, token);
+    assert.equal(blocked.status, 409, "issuance before credential-eligibility must be refused");
+    const issued = await post(harness.baseUrl, "/v1/credentials", ISSUE_BODY, token);
+    assert.equal(issued.status, 201);
+    const credential = issued.body["credential"] as Record<string, unknown>;
+    assert.deepEqual(credential["@context"], ["https://www.w3.org/ns/credentials/v2"]);
+    assert.deepEqual(credential["type"], ["VerifiableCredential", "SeafarerCoC"]);
+    assert.equal(credential["issuer"], ISSUER_DID);
+    const proof = credential["proof"] as Record<string, unknown>;
+    assert.equal(proof["cryptosuite"], "eddsa-jcs-2022");
+    issuedCredential = credential;
+    issuedCredentialId = String(credential["id"]);
+  });
+
+  await t.test("employer verifies the issued credential online via the service", async () => {
+    const token = await harness.token([ROLE_EMPLOYER]);
+    const verified = await post(harness.baseUrl, "/v1/verify", { credential: issuedCredential, holderId: ISSUE_BODY.holderId }, token);
+    assert.equal(verified.status, 200);
+    assert.equal((verified.body as Record<string, unknown>)["credentialId"], issuedCredentialId);
+  });
+
+  await t.test("nimasa-approver revokes and verification then fails closed", async () => {
+    const approver = await harness.token([ROLE_NIMASA_APPROVER]);
+    const revoked = await post(harness.baseUrl, "/v1/revoke", {
+      credentialId: issuedCredentialId,
+      holderId: ISSUE_BODY.holderId,
+      reason: "certificate withdrawn",
+    }, approver);
+    assert.equal(revoked.status, 200);
+    const employer = await harness.token([ROLE_PSC_INSPECTOR]);
+    const verified = await post(harness.baseUrl, "/v1/verify", { credential: issuedCredential, holderId: ISSUE_BODY.holderId }, employer);
+    assert.equal(verified.status, 422);
+    assert.match(String((verified.body as Record<string, unknown>)["error"]), /revoked/);
+  });
+
+  await t.test("auditor reads the signed status list", async () => {
+    const token = await harness.token([ROLE_AUDITOR]);
+    const statusList = await get(harness.baseUrl, "/v1/status-list/main", token);
+    assert.equal(statusList.status, 200);
+    assert.deepEqual((statusList.body as Record<string, unknown>)["type"], ["VerifiableCredential", "BitstringStatusListCredential"]);
+    assert.ok((statusList.body as Record<string, unknown>)["proof"] !== undefined);
+  });
+});
+
+test("authorizeRequest enforces the role matrix fail-closed", () => {
+  assert.throws(() => authorizeRequest("GET", new Set(), [ROLE_AUDITOR]), AuthorizationError);
+  assert.throws(() => authorizeRequest("POST", new Set([ROLE_AUDITOR]), [ROLE_AUDITOR]), AuthorizationError);
+  authorizeRequest("GET", new Set([ROLE_AUDITOR]), [ROLE_AUDITOR]);
+  assert.throws(() => authorizeRequest("POST", new Set([ROLE_EMPLOYER]), [ROLE_NIMASA_APPROVER]), AuthorizationError);
+  authorizeRequest("POST", new Set([ROLE_NIMASA_APPROVER]), [ROLE_NIMASA_APPROVER]);
+  authorizeRequest("POST", new Set([ROLE_PSC_INSPECTOR]), [ROLE_EMPLOYER, ROLE_PSC_INSPECTOR]);
+});

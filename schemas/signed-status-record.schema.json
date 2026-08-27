@@ -4,15 +4,68 @@
   "title": "S4 Signed Credential Status Record",
   "type": "object",
   "additionalProperties": false,
-  "required": ["sequence", "issuer", "jti_sha256", "status", "effective_at", "updated_by", "signature"],
+  "required": [
+    "protected_jws",
+    "claims"
+  ],
   "properties": {
-    "sequence": {"type": "integer", "minimum": 1},
-    "issuer": {"type": "string", "format": "uri", "pattern": "^https://"},
-    "jti_sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
-    "status": {"enum": ["ACTIVE", "SUSPENDED", "REVOKED"]},
-    "effective_at": {"type": "string", "format": "date-time"},
-    "updated_by": {"type": "string", "minLength": 1, "maxLength": 256},
-    "reason": {"type": "string", "maxLength": 1024},
-    "signature": {"type": "string", "minLength": 1, "description": "Compact JWS over canonical record claims."}
+    "protected_jws": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Compact JWS over the canonical status claims."
+    },
+    "claims": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "sequence",
+        "credential_id_reference_sha256",
+        "status",
+        "reason",
+        "effective_at",
+        "updated_by",
+        "issuer"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": "blueeconomy.credential.status.v1"
+        },
+        "sequence": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "credential_id_reference_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "status": {
+          "enum": [
+            "ACTIVE",
+            "SUSPENDED",
+            "REVOKED"
+          ]
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "effective_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updated_by": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "issuer": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        }
+      }
+    }
   }
 }
