@@ -130,6 +130,16 @@ export class PgStatusStore implements StatusStore {
   }
 }
 
+/**
+ * Enqueues a single outbox message into credential_outbox. Used by the
+ * Temporal worker, whose revocation activity publishes events without a
+ * companion status-row upsert (the status transition happens via the API).
+ */
+export async function enqueueOutboxMessage(executor: SqlExecutor, message: OutboxMessage): Promise<void> {
+  assertOutboxMessage(message);
+  await executor.query(INSERT_OUTBOX, [message.topic, message.eventId, JSON.stringify(message.payload)]);
+}
+
 export function createPgStatusStore(databaseUrl: string): PgStatusStore {
   const pool = new pg.Pool({ connectionString: databaseUrl, max: 4, connectionTimeoutMillis: 5_000 });
   return new PgStatusStore({ executor: pool, ownsExecutor: () => pool.end() });

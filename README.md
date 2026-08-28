@@ -17,6 +17,12 @@ Issuance is allowed only after the `SeafarerCredentialWorkflow` (Temporal) repor
 
 `exam-registration → exam-result (must pass) → training-completion → credential-eligibility → issuance`, with `revocation-requested` accepted at any time. Every stage has an SLA timer; breaches are recorded in the `observer` query without advancing the stage machine.
 
+## Temporal worker (seafarer-credential-worker)
+
+`src/worker.ts` (`npm run worker` → `node dist/worker.js`) is the lifecycle worker the gitops chart deploys as `seafarer-credential-worker`. It registers the `SeafarerCredentialWorkflow` bundle and the revocation activity (ledger commit + signed envelope + outbox row) against a Temporal task queue, and shuts down gracefully on SIGINT/SIGTERM.
+
+Worker configuration (all fail-closed unless noted): `BLUEECONOMY_TEMPORAL_ADDRESS`, `BLUEECONOMY_TEMPORAL_TASK_QUEUE` (chart default `seafarer-credential`), `BLUEECONOMY_STATUS_DATABASE_URL` (outbox enqueue), `BLUEECONOMY_TIGERBEETLE_ADDRESSES` (revocation ledger commit), `BLUEECONOMY_ISSUER_ED25519_PKCS8_PEM_PATH` (envelope signing). Optional: `BLUEECONOMY_TEMPORAL_NAMESPACE` (default `default`), `BLUEECONOMY_EVENT_PRODUCER`, `BLUEECONOMY_TIGERBEETLE_CLUSTER_ID`, `BLUEECONOMY_TIGERBEETLE_LEDGER`.
+
 ## HTTP API
 
 | Route | Roles |
