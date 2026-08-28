@@ -40,6 +40,7 @@ export function createJsonlTestStatusStore(path: string, env: NodeJS.ProcessEnv)
   const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
   const registry = new StatusRegistry({ path, issuer, key: privateKey as never, algorithm: "RS256", keyId: "jsonl-test-key" });
   const placementByCredential = new Map<string, { statusListId: string; statusListIndex: number }>();
+  const nextIndexByList = new Map<string, number>();
   const holderCredentials = new Map<string, { holderId: string; document: Record<string, unknown>; validUntil: Date }>();
 
   async function readLines(): Promise<JsonlLine[]> {
@@ -131,6 +132,21 @@ export function createJsonlTestStatusStore(path: string, env: NodeJS.ProcessEnv)
         records.push({ document: held.document, validUntil: held.validUntil.toISOString() });
       }
       return records;
+    },
+    async allocateStatusListIndex(statusListId: string): Promise<number> {
+      // Single-process test store: a per-list in-memory counter seeded above
+      // every index already placed in this process (restart collision is a
+      // production concern covered by the PostgreSQL allocator).
+      const used = [...placementByCredential.values()]
+        .filter((placement) => placement.statusListId === statusListId)
+        .map((placement) => placement.statusListIndex);
+      const floor = used.length === 0 ? -1 : Math.max(...used);
+      const next = Math.max(floor + 1, nextIndexByList.get(statusListId) ?? 0);
+      if (next >= 1_048_576) {
+        throw new Error(`status list ${statusListId} bitstring index space is exhausted (fail-closed)`);
+      }
+      nextIndexByList.set(statusListId, next + 1);
+      return next;
     },
     async healthCheck(): Promise<void> {
       // File-backed test store has no liveness dependency.

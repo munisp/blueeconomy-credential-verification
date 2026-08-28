@@ -59,15 +59,11 @@ export interface CredentialServiceDependencies {
   eligibilityGate: EligibilityGate;
   producer: string;
   statusListId: string;
-  allocateStatusListIndex(): number;
+  allocateStatusListIndex(): Promise<number>;
 }
 
 export class CredentialService {
-  private readonly allocation: { next: number };
-
-  public constructor(private readonly deps: CredentialServiceDependencies) {
-    this.allocation = { next: 0 };
-  }
+  public constructor(private readonly deps: CredentialServiceDependencies) {}
 
   public async issueCredential(input: IssueCredentialInput, principal: Principal): Promise<IssuedCredentialResult> {
     const decision = await this.deps.eligibilityGate.check(input.workflowId, input.seafarerId);
@@ -78,7 +74,13 @@ export class CredentialService {
     if (!Number.isFinite(validUntil.getTime())) throw new ServiceError(400, "validUntil must be a valid date-time");
     const now = new Date();
     const credentialId = `urn:uuid:${deterministicEventId("seafarer.credential.v1", `issue|${input.workflowId}|${input.holderId}`)}`;
-    const statusListIndex = this.deps.allocateStatusListIndex();
+    // Revocation is terminal: re-issuing a revoked credential would silently
+    // reverse a published revocation, so refuse truthfully before allocating.
+    const existingStatus = await this.deps.statusStore.getStatus(credentialId, this.deps.issuer.issuerDid);
+    if (existingStatus?.status === "REVOKED") {
+      throw new ServiceError(409, "credential is revoked; re-issuance is prohibited because revocation is terminal");
+    }
+    const statusListIndex = await this.deps.allocateStatusListIndex();
     const credential = issueCoCCredential(this.deps.issuer, {
       credentialId,
       holderId: input.holderId,
@@ -152,6 +154,7 @@ export class CredentialService {
   public async revokeCredential(input: RevokeCredentialInput, principal: Principal): Promise<{ eventId: string; ledgerCommitHash: string }> {
     const existing = await this.deps.statusStore.getStatus(input.credentialId, this.deps.issuer.issuerDid);
     if (existing === undefined) throw new ServiceError(404, "credential is unknown to this issuer");
+    if (existing.status === "REVOKED") throw new ServiceError(409, "credential is already revoked; revocation is terminal");
     const now = new Date();
     const commit = await this.deps.ledger.record({
       credentialId: input.credentialId, holderReference: input.holderId,

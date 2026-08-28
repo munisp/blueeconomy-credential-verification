@@ -36,6 +36,10 @@ interface StatusRow extends pg.QueryResultRow {
   sequence: string;
 }
 
+// The WHERE clause makes REVOKED terminal at the statement layer: an update
+// against a revoked row matches nothing, RETURNING yields no row and the
+// caller surfaces a truthful refusal instead of silently reversing the
+// revocation. Migration 0004 additionally enforces the invariant by trigger.
 const UPSERT_STATUS = `
 INSERT INTO credential_status (
   credential_id_reference_sha256, issuer, status, reason,
@@ -49,13 +53,40 @@ ON CONFLICT (credential_id_reference_sha256) DO UPDATE SET
   updated_by = EXCLUDED.updated_by,
   effective_at = EXCLUDED.effective_at,
   updated_at = now()
+WHERE credential_status.status <> 'REVOKED'
 RETURNING credential_id_reference_sha256, issuer, status, reason,
   status_list_id, status_list_index, updated_by, effective_at, updated_at, sequence`;
 
+const SELECT_CURRENT_STATUS = `
+SELECT status
+  FROM credential_status
+ WHERE credential_id_reference_sha256 = $1`;
+
+// RETURNING exposes dedup swallows: when the event id already exists the
+// insert yields no row and the caller must verify the stored payload matches
+// (benign replay) or fail closed (a state transition was being swallowed).
 const INSERT_OUTBOX = `
 INSERT INTO credential_outbox (topic, event_id, payload)
 VALUES ($1, $2, $3::jsonb)
-ON CONFLICT (event_id) DO NOTHING`;
+ON CONFLICT (event_id) DO NOTHING
+RETURNING id`;
+
+const SELECT_OUTBOX_BY_EVENT_ID = `
+SELECT topic, payload::text AS payload_text
+  FROM credential_outbox
+ WHERE event_id = $1`;
+
+// Serialized per-list allocation: the UPDATE takes a row lock on the counter
+// row, so concurrent replicas allocate disjoint indices, and the row survives
+// restarts so allocation resumes without collision. The 0003 UNIQUE index on
+// (issuer, status_list_id, status_list_index) backstops the invariant.
+const ALLOCATE_STATUS_LIST_INDEX = `
+INSERT INTO status_list_allocator (status_list_id, next_index)
+VALUES ($1, 1)
+ON CONFLICT (status_list_id) DO UPDATE SET
+  next_index = status_list_allocator.next_index + 1
+WHERE status_list_allocator.next_index < 1048576
+RETURNING next_index - 1 AS allocated_index`;
 
 const INSERT_HOLDER_CREDENTIAL = `
 INSERT INTO holder_credentials (
@@ -96,7 +127,16 @@ export class PgStatusStore implements StatusStore {
         entry.statusListId, entry.statusListIndex, entry.updatedBy, effectiveAt,
       ]);
       const row = result.rows[0];
-      if (row === undefined) throw new Error("status upsert returned no row");
+      if (row === undefined) {
+        // The guarded upsert only yields no row when the existing record is
+        // REVOKED; verify and report truthfully (fail closed).
+        const current = await client.query<{ status: StatusRecord["status"] } & pg.QueryResultRow>(SELECT_CURRENT_STATUS, [reference]);
+        const status = current.rows[0]?.status;
+        if (status === "REVOKED") {
+          throw new Error("credential status REVOKED is terminal; the requested transition was refused");
+        }
+        throw new Error("status upsert returned no row");
+      }
       if (entry.issuance !== undefined) {
         await client.query(INSERT_HOLDER_CREDENTIAL, [
           reference, entry.issuance.holderId, entry.issuer,
@@ -104,7 +144,7 @@ export class PgStatusStore implements StatusStore {
         ]);
       }
       if (outbox !== undefined) {
-        await client.query(INSERT_OUTBOX, [outbox.topic, outbox.eventId, JSON.stringify(outbox.payload)]);
+        await insertOutboxVerified(client, outbox);
       }
       if (transactional) await client.query("COMMIT");
       return mapRow(row);
@@ -155,6 +195,25 @@ export class PgStatusStore implements StatusStore {
     }));
   }
 
+  public async allocateStatusListIndex(statusListId: string): Promise<number> {
+    if (!/^[A-Za-z0-9._:/-]{1,512}$/.test(statusListId)) {
+      throw new Error("status list id must be a canonical identifier or URL");
+    }
+    const result = await this.executor.query<{ allocated_index: number | string } & pg.QueryResultRow>(
+      ALLOCATE_STATUS_LIST_INDEX,
+      [statusListId],
+    );
+    const row = result.rows[0];
+    if (row === undefined) {
+      throw new Error(`status list ${statusListId} bitstring index space is exhausted (fail-closed)`);
+    }
+    const allocated = Number(row.allocated_index);
+    if (!Number.isInteger(allocated) || allocated < 0 || allocated >= 1_048_576) {
+      throw new Error("status list allocator returned an out-of-range index (fail-closed)");
+    }
+    return allocated;
+  }
+
   public async healthCheck(): Promise<void> {
     await this.executor.query("SELECT 1");
   }
@@ -171,7 +230,54 @@ export class PgStatusStore implements StatusStore {
  */
 export async function enqueueOutboxMessage(executor: SqlExecutor, message: OutboxMessage): Promise<void> {
   assertOutboxMessage(message);
-  await executor.query(INSERT_OUTBOX, [message.topic, message.eventId, JSON.stringify(message.payload)]);
+  await insertOutboxVerified(executor, message);
+}
+
+/**
+ * Inserts an outbox message without letting event-id dedup swallow a state
+ * transition. An idempotent replay (identical topic and payload already
+ * stored under the same deterministic event id) is accepted as a no-op; a
+ * conflicting payload under the same event id means a distinct transition was
+ * being silently dropped, which fails closed.
+ */
+async function insertOutboxVerified(client: SqlExecutor, message: OutboxMessage): Promise<void> {
+  const payloadText = JSON.stringify(message.payload);
+  const inserted = await client.query<{ id: number | string } & pg.QueryResultRow>(
+    INSERT_OUTBOX,
+    [message.topic, message.eventId, payloadText],
+  );
+  if (inserted.rows.length > 0) return;
+  const existing = await client.query<{ topic: string; payload_text: string } & pg.QueryResultRow>(
+    SELECT_OUTBOX_BY_EVENT_ID,
+    [message.eventId],
+  );
+  const row = existing.rows[0];
+  if (row === undefined) {
+    throw new Error("outbox insert conflicted but no stored event is visible (fail-closed)");
+  }
+  if (row.topic !== message.topic || !jsonDeepEqual(row.payload_text, payloadText)) {
+    throw new Error(
+      `outbox event id ${message.eventId} already exists with different content; refusing to swallow a state transition (fail-closed)`,
+    );
+  }
+}
+
+/** Compares two JSON texts semantically (jsonb key order is not significant). */
+function jsonDeepEqual(stored: string, candidate: string): boolean {
+  try {
+    return canonicalJson(JSON.parse(stored)) === canonicalJson(JSON.parse(candidate));
+  } catch {
+    return false;
+  }
+}
+
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "null";
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  const entries = Object.entries(value as Record<string, unknown>)
+    .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+    .map(([key, entry]) => `${JSON.stringify(key)}:${canonicalJson(entry)}`);
+  return `{${entries.join(",")}}`;
 }
 
 export function createPgStatusStore(databaseUrl: string): PgStatusStore {

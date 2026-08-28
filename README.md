@@ -35,17 +35,56 @@ Worker configuration (all fail-closed unless noted): `BLUEECONOMY_TEMPORAL_ADDRE
 | `GET /v1/issuers/{issuer}/key` | public (issuer Ed25519 public key as `{ issuer, kid, public_key_hex }` for offline eddsa-jcs-2022 verification; 404 for unknown issuers) |
 | `GET /healthz` `GET /readyz` `GET /metrics` | unauthenticated probes |
 
-Authentication is Keycloak RS256 via JWKS (`jose`), ported from `blueeconomy-administration-service/internal/admin`: roles are read from `realm_access.roles` and configured `resource_access[client].roles`; the authorizer is fail-closed (roleless identities denied, `auditor` denied every mutation, unknown routes 404).
+Authentication is Keycloak RS256 via JWKS (`jose`), ported from `blueeconomy-administration-service/internal/admin`: roles are read from `realm_access.roles` and configured `resource_access[client].roles`; the authorizer is fail-closed (roleless identities denied, `auditor` denied every mutation, unknown routes 404). Optional `tenant` and `clearance` JWT claims are propagated to the policy engine.
+
+## Embedded PBAC (policy-based access control)
+
+Every authenticated route is additionally gated by an embedded, deny-by-default policy engine (`src/auth/pbac.ts`). OPA's Go SDK is unavailable to TypeScript services, so the engine evaluates a small rego-independent JSON format any platform service can implement. Policies load once at startup from `POLICY_DIR`, fail-closed: a missing directory, no `*.policy.json` files, malformed JSON, a schema violation, a duplicate rule name, or zero rules aborts boot. There is no fail-open path; a request that matches no allow-rule is denied with 403 and counted (`blueeconomy_pbac_denied_total`).
+
+### Policy file format (`<POLICY_DIR>/*.policy.json`)
+
+```json
+{
+  "version": "1.0",
+  "policies": [
+    {
+      "name": "nimasa-approver-issues-credentials",
+      "roles": ["nimasa-approver"],
+      "clearance": ["*"],
+      "tenant": "*",
+      "resource": "credential",
+      "action": "issue",
+      "classification": ["CONFIDENTIAL"]
+    }
+  ]
+}
+```
+
+- `version` (required): must be `"1.0"`.
+- `policies` (required): array of ALLOW rules; anything not matched is DENIED.
+- `name` (required): stable rule identifier, unique across all loaded files.
+- `roles` (required): non-empty list of principal roles, or `["*"]` for any authenticated role. A request matches when it holds at least one listed role.
+- `resource`, `action` (required): identifiers (for example `credential`/`issue`, `wallet`/`read`, `status-list`/`read`) or `"*"`.
+- `tenant` (optional): exact tenant id or `"*"`; a rule naming a tenant never matches a request without a tenant claim.
+- `clearance` (optional): list of clearance labels or `["*"]`; a rule listing clearances never matches a request without a clearance claim.
+- `classification` (optional): subset of `PUBLIC | INTERNAL | CONFIDENTIAL | RESTRICTED | FIDUCIARY_SEGREGATED` or `["*"]`.
+
+Unknown fields, unknown classification labels and malformed identifiers are boot-fatal. The shipped `policies/credential-verification.policy.json` encodes the route matrix in the table above.
+
+## Envelope provenance signature verification
+
+`src/events/envelope-verification.ts` is the shared consumer-side verifier for the fleet signature scheme (blueeconomy-contracts `docs/envelope-signature.md`): `provenance.signature` is a JWS compact serialization (EdDSA/Ed25519, via `jose`) over the JCS-canonicalized (RFC 8785) JSON of the full envelope excluding the signature field, with protected header `{"alg":"EdDSA","kid":"<producer>-<epoch>"}`. Producer public keys resolve from a mounted key directory shaped `{kid: base64url-ed25519-pubkey}` whose path comes from `KEY_DIRECTORY_PATH`; loading fails closed (unreadable file, invalid JSON, malformed kid or key all abort startup). Verification rejects with reason codes `malformed-jws`, `unsupported-alg`, `unknown-kid`, `payload-mismatch` (the JWS payload must byte-equal the re-canonicalized envelope) and `invalid-signature`; rejected envelopes must never be persisted.
 
 ## Durability, events and ledger
 
-- **Status registry**: PostgreSQL (`migrations/0001_credential_status.sql`, parameterized SQL, upsert + outbox in one transaction). Fail-closed without `BLUEECONOMY_STATUS_DATABASE_URL`; the legacy single-process JSONL store is available only behind the explicit `BLUEECONOMY_STATUS_JSONL_TEST_PATH` test flag.
+- **Status registry**: PostgreSQL (`migrations/`, parameterized SQL, upsert + outbox in one transaction). Fail-closed without `BLUEECONOMY_STATUS_DATABASE_URL`; the legacy single-process JSONL store is available only behind the explicit `BLUEECONOMY_STATUS_JSONL_TEST_PATH` test flag. **Revocation is terminal**: the status upsert is guarded (`WHERE status <> 'REVOKED'`) and migration `0004` enforces the invariant by trigger, so re-issuance after revocation is refused truthfully (409) instead of silently flipping REVOKED back to ACTIVE. Outbox event-id dedup is verified: an identical replay is a no-op, but a conflicting payload under an existing event id fails closed rather than swallowing a state transition.
+- **Status-list index allocation**: durable per-list counter (`status_list_allocator`, migration `0003`) serialized by `INSERT ... ON CONFLICT DO UPDATE ... RETURNING`, so concurrent replicas allocate disjoint bitstring indices and restarts resume without collision; a `UNIQUE (issuer, status_list_id, status_list_index)` index backstops the invariant. The retired in-process counter (`BLUEECONOMY_STATUS_LIST_INDEX_START`) is removed.
 - **Events**: platform envelope `envelopeVersion 1.0` with deterministic `eventId`, FHIR R4 Bundle message entry (VC carried as a base64 `DocumentReference` attachment), provenance (principalId, principalRole, Ed25519 signature over the SHA-256 digest of the JCS-canonical payload, TigerBeetle `ledgerCommitHash`), classification `CONFIDENTIAL`. Published through the transactional outbox to Kafka topics `seafarer.credential.v1` / `seafarer.revocation.v1` (`kafkajs`, idempotent producer).
 - **Ledger**: TigerBeetle issuance ledger behind the `IssuanceLedger` interface; transfer IDs are deterministic SHA-256 derivations so retries are idempotent (`exists` is a successful replay). Fail-closed without `BLUEECONOMY_TIGERBEETLE_ADDRESSES`.
 
 ## Configuration
 
-Required (fail-closed): `BLUEECONOMY_ISSUER_DID`, `BLUEECONOMY_ISSUER_ED25519_PKCS8_PEM_PATH`, `BLUEECONOMY_STATUS_LIST_URL`, `BLUEECONOMY_STATUS_DATABASE_URL`, `BLUEECONOMY_TIGERBEETLE_ADDRESSES`, `BLUEECONOMY_TEMPORAL_ADDRESS`, `BLUEECONOMY_OIDC_JWKS_URL`, `BLUEECONOMY_OIDC_ISSUER`, `BLUEECONOMY_OIDC_AUDIENCE`. Optional: `BLUEECONOMY_KAFKA_BROKERS` (outbox publisher), `BLUEECONOMY_OIDC_ROLES_CLIENT_IDS`, `PORT` (default 8080), `BLUEECONOMY_EVENT_PRODUCER`, `BLUEECONOMY_TEMPORAL_NAMESPACE`.
+Required (fail-closed): `BLUEECONOMY_ISSUER_DID`, `BLUEECONOMY_ISSUER_ED25519_PKCS8_PEM_PATH`, `BLUEECONOMY_STATUS_LIST_URL`, `BLUEECONOMY_STATUS_DATABASE_URL`, `BLUEECONOMY_TIGERBEETLE_ADDRESSES`, `BLUEECONOMY_TEMPORAL_ADDRESS`, `BLUEECONOMY_OIDC_JWKS_URL`, `BLUEECONOMY_OIDC_ISSUER`, `BLUEECONOMY_OIDC_AUDIENCE`, `POLICY_DIR` (PBAC policy directory). Envelope-signature consumers additionally require `KEY_DIRECTORY_PATH` (mounted producer public-key directory). Optional: `BLUEECONOMY_KAFKA_BROKERS` (outbox publisher), `BLUEECONOMY_OIDC_ROLES_CLIENT_IDS`, `PORT` (default 8080), `BLUEECONOMY_EVENT_PRODUCER`, `BLUEECONOMY_TEMPORAL_NAMESPACE`.
 
 ## Schema contracts
 

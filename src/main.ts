@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import process from "node:process";
 import { createAuthenticatorFromEnv } from "./auth/keycloak.js";
+import { PolicyEngine } from "./auth/pbac.js";
 import { createHttpService } from "./http/server.js";
 import { createIssuanceLedgerFromEnv } from "./ledger/issuance-ledger.js";
 import { CredentialService } from "./service/credential-service.js";
@@ -29,7 +30,8 @@ async function main(): Promise<void> {
   const ledger = createIssuanceLedgerFromEnv(env);
   const eligibilityGate = await createEligibilityGateFromEnv(env);
   const authenticator = createAuthenticatorFromEnv(env);
-  let nextIndex = Number.parseInt(env["BLUEECONOMY_STATUS_LIST_INDEX_START"] ?? "0", 10);
+  // Deny-by-default PBAC, loaded fail-closed from POLICY_DIR before listening.
+  const policyEngine = await PolicyEngine.fromEnv(env);
   const service = new CredentialService({
     issuer: { issuerDid, verificationMethod, privateKey, statusListCredentialUrl: statusListId },
     statusStore,
@@ -37,9 +39,11 @@ async function main(): Promise<void> {
     eligibilityGate,
     producer,
     statusListId,
-    allocateStatusListIndex: () => nextIndex++,
+    // Durable per-list allocation (restart- and replica-safe), replacing the
+    // retired in-process BLUEECONOMY_STATUS_LIST_INDEX_START counter.
+    allocateStatusListIndex: () => statusStore.allocateStatusListIndex(statusListId),
   });
-  const { server } = createHttpService({ authenticator, service, statusStore });
+  const { server } = createHttpService({ authenticator, policyEngine, service, statusStore });
   await new Promise<void>((resolveListen) => server.listen(port, resolveListen));
   process.stdout.write(`credential-verification listening on :${port}\n`);
 }

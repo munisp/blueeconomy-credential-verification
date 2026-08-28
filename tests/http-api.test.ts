@@ -9,6 +9,7 @@ import { SignJWT, createLocalJWKSet, exportJWK, generateKeyPair } from "jose";
 import { KeycloakAuthenticator, authorizeRequest, AuthorizationError, ROLE_AUDITOR, ROLE_EMPLOYER, ROLE_NIMASA_APPROVER, ROLE_PSC_INSPECTOR, ROLE_SEAFARER, type PrincipalRole } from "../src/auth/keycloak.js";
 import { createHttpService } from "../src/http/server.js";
 import { CredentialService } from "../src/service/credential-service.js";
+import { PolicyEngine } from "../src/auth/pbac.js";
 import { createJsonlTestStatusStore } from "../src/status/jsonl-test-store.js";
 import { generateEphemeralIssuerKeyPair } from "../src/vc/issuer.js";
 import type { EligibilityGate } from "../src/temporal/eligibility-gate.js";
@@ -25,7 +26,18 @@ interface Harness {
   token(roles: PrincipalRole[], subject?: string): Promise<string>;
 }
 
-async function startHarness(): Promise<Harness> {
+const POLICY_DOCUMENT = {
+  version: "1.0",
+  policies: [
+    { name: "nimasa-approver-issues-credentials", roles: ["nimasa-approver"], tenant: "*", resource: "credential", action: "issue", classification: ["CONFIDENTIAL"] },
+    { name: "nimasa-approver-revokes-credentials", roles: ["nimasa-approver"], tenant: "*", resource: "credential", action: "revoke", classification: ["CONFIDENTIAL"] },
+    { name: "verifiers-verify-credentials", roles: ["employer", "psc-inspector"], tenant: "*", resource: "credential", action: "verify", classification: ["CONFIDENTIAL"] },
+    { name: "seafarer-reads-own-wallet", roles: ["seafarer"], tenant: "*", resource: "wallet", action: "read", classification: ["CONFIDENTIAL"] },
+    { name: "authenticated-roles-read-status-list", roles: ["nimasa-approver", "employer", "psc-inspector", "auditor", "seafarer"], tenant: "*", resource: "status-list", action: "read", classification: ["CONFIDENTIAL"] },
+  ],
+};
+
+async function startHarness(options: { policyDocument?: Record<string, unknown> } = {}): Promise<Harness> {
   const { privateKey: oidcKey, publicKey: oidcPublic } = await generateKeyPair("RS256");
   const jwk = await exportJWK(oidcPublic);
   jwk.kid = "keycloak-test-key";
@@ -39,6 +51,11 @@ async function startHarness(): Promise<Harness> {
   });
 
   const directory = await mkdtemp(join(tmpdir(), "blueeconomy-http-"));
+  const { writeFile, mkdir } = await import("node:fs/promises");
+  const policyDirectory = join(directory, "policies");
+  await mkdir(policyDirectory);
+  await writeFile(join(policyDirectory, "test.policy.json"), JSON.stringify(options.policyDocument ?? POLICY_DOCUMENT));
+  const policyEngine = await PolicyEngine.load(policyDirectory);
   const statusStore: StatusStore = createJsonlTestStatusStore(join(directory, "status.jsonl"), {
     BLUEECONOMY_STATUS_JSONL_TEST_PATH: join(directory, "status.jsonl"),
     BLUEECONOMY_STATUS_ISSUER: ISSUER_DID,
@@ -81,10 +98,10 @@ async function startHarness(): Promise<Harness> {
     eligibilityGate,
     producer: "blueeconomy-credential-verification",
     statusListId: "https://credentials.nimasa.gov.ng/v1/status-list/main",
-    allocateStatusListIndex: () => nextIndex++,
+    allocateStatusListIndex: async () => nextIndex++,
   });
 
-  const { server } = createHttpService({ authenticator, service, statusStore });
+  const { server } = createHttpService({ authenticator, policyEngine, service, statusStore });
   await new Promise<void>((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));
   const address = server.address() as AddressInfo;
   return {
@@ -218,6 +235,20 @@ test("issuer and verifier HTTP surface with role matrix", async (t) => {
     assert.match(String((verified.body as Record<string, unknown>)["error"]), /revoked/);
   });
 
+  await t.test("revocation is terminal: re-issuance and double revocation are refused", async () => {
+    const approver = await harness.token([ROLE_NIMASA_APPROVER]);
+    const reissued = await post(harness.baseUrl, "/v1/credentials", ISSUE_BODY, approver);
+    assert.equal(reissued.status, 409, "re-issuing a revoked credential must be refused");
+    assert.match(String(reissued.body["error"]), /revocation is terminal/);
+    const revokedAgain = await post(harness.baseUrl, "/v1/revoke", {
+      credentialId: issuedCredentialId,
+      holderId: ISSUE_BODY.holderId,
+      reason: "duplicate revocation",
+    }, approver);
+    assert.equal(revokedAgain.status, 409, "revoking an already-revoked credential must be refused");
+    assert.match(String(revokedAgain.body["error"]), /already revoked/);
+  });
+
   await t.test("auditor reads the signed status list", async () => {
     const token = await harness.token([ROLE_AUDITOR]);
     const statusList = await get(harness.baseUrl, "/v1/status-list/main", token);
@@ -303,4 +334,34 @@ test("authorizeRequest enforces the role matrix fail-closed", () => {
   assert.throws(() => authorizeRequest("POST", new Set([ROLE_EMPLOYER]), [ROLE_NIMASA_APPROVER]), AuthorizationError);
   authorizeRequest("POST", new Set([ROLE_NIMASA_APPROVER]), [ROLE_NIMASA_APPROVER]);
   authorizeRequest("POST", new Set([ROLE_PSC_INSPECTOR]), [ROLE_EMPLOYER, ROLE_PSC_INSPECTOR]);
+});
+
+test("PBAC middleware denies routes without a matching allow-rule", async (t) => {
+  // Policy document identical to the baseline but WITHOUT the wallet and
+  // status-list rules: the static role table still admits these callers, so
+  // any denial is attributable to the policy engine (deny-by-default).
+  const restrictive = {
+    version: "1.0",
+    policies: [
+      { name: "nimasa-approver-issues-credentials", roles: ["nimasa-approver"], tenant: "*", resource: "credential", action: "issue", classification: ["CONFIDENTIAL"] },
+      { name: "nimasa-approver-revokes-credentials", roles: ["nimasa-approver"], tenant: "*", resource: "credential", action: "revoke", classification: ["CONFIDENTIAL"] },
+      { name: "verifiers-verify-credentials", roles: ["employer", "psc-inspector"], tenant: "*", resource: "credential", action: "verify", classification: ["CONFIDENTIAL"] },
+    ],
+  };
+  const harness = await startHarness({ policyDocument: restrictive });
+  t.after(() => harness.close());
+
+  const seafarer = await harness.token([ROLE_SEAFARER]);
+  const wallet = await get(harness.baseUrl, "/v1/wallet/credentials/current", seafarer);
+  assert.equal(wallet.status, 403, "policy engine must deny the wallet route without an allow-rule");
+  assert.match(String(wallet.body["error"]), /denied by policy/);
+
+  const auditor = await harness.token([ROLE_AUDITOR]);
+  const statusList = await get(harness.baseUrl, "/v1/status-list/main", auditor);
+  assert.equal(statusList.status, 403, "policy engine must deny the status-list route without an allow-rule");
+
+  // Routes whose rules remain continue to work (allow rules still apply).
+  const approver = await harness.token([ROLE_NIMASA_APPROVER]);
+  const blocked = await post(harness.baseUrl, "/v1/credentials", { ...ISSUE_BODY, workflowId: "wf-not-eligible" }, approver);
+  assert.equal(blocked.status, 409, "an allowed route still reaches the service layer");
 });

@@ -1,16 +1,26 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { AuthenticationError, AuthorizationError, authorizeRequest, type AuthenticatedPrincipal, type KeycloakAuthenticator, type PrincipalRole, ROLE_AUDITOR, ROLE_EMPLOYER, ROLE_NIMASA_APPROVER, ROLE_PSC_INSPECTOR, ROLE_SEAFARER } from "../auth/keycloak.js";
+import type { Classification, PolicyEngine } from "../auth/pbac.js";
 import { CredentialService, ServiceError } from "../service/credential-service.js";
 import type { StatusStore } from "../status/store.js";
 
 /**
  * Issuer/verifier HTTP surface. The route table is the single source of
  * truth; any route not present here is denied by default (fail-closed),
- * mirroring the Go administration-service authorizer.
+ * mirroring the Go administration-service authorizer. Authenticated routes
+ * additionally carry PBAC metadata evaluated by the embedded deny-by-default
+ * policy engine (loaded fail-closed from POLICY_DIR at startup).
  */
+
+export interface RoutePolicy {
+  resource: string;
+  action: string;
+  classification: Classification;
+}
 
 export interface HttpServiceDependencies {
   authenticator: KeycloakAuthenticator;
+  policyEngine: PolicyEngine;
   service: CredentialService;
   statusStore: StatusStore;
 }
@@ -21,6 +31,7 @@ interface Route {
   pattern: RegExp;
   paramNames: string[];
   roles: readonly PrincipalRole[] | null;
+  policy?: RoutePolicy;
   handler: (request: RouteRequest) => Promise<{ status: number; body: unknown }>;
 }
 
@@ -64,7 +75,7 @@ export function createHttpService(deps: HttpServiceDependencies): { server: Serv
       return { status: 200, body: { status: "ready" } };
     }),
     "GET /metrics": route(/^\/metrics$/, [], null, async () => ({ status: 200, body: metrics.render(), })),
-    "POST /v1/credentials": route(/^\/v1\/credentials$/, [], [ROLE_NIMASA_APPROVER], async (request) => {
+    "POST /v1/credentials": route(/^\/v1\/credentials$/, [], [ROLE_NIMASA_APPROVER], { resource: "credential", action: "issue", classification: "CONFIDENTIAL" }, async (request) => {
       const body = assertObject(request.body);
       const principal = assertPrincipal(request.principal);
       const result = await deps.service.issueCredential({
@@ -82,17 +93,17 @@ export function createHttpService(deps: HttpServiceDependencies): { server: Serv
       metrics.increment("blueeconomy_vc_issued_total");
       return { status: 201, body: result };
     }),
-    "POST /v1/verify": route(/^\/v1\/verify$/, [], [ROLE_EMPLOYER, ROLE_PSC_INSPECTOR], async (request) => {
+    "POST /v1/verify": route(/^\/v1\/verify$/, [], [ROLE_EMPLOYER, ROLE_PSC_INSPECTOR], { resource: "credential", action: "verify", classification: "CONFIDENTIAL" }, async (request) => {
       const body = assertObject(request.body);
       const result = await deps.service.verifyCredential(body["credential"], assertString(body, "holderId"));
       metrics.increment("blueeconomy_vc_verified_total");
       return { status: 200, body: result };
     }),
-    "GET /v1/status-list/{id}": route(/^\/v1\/status-list\/([A-Za-z0-9._:-]{1,128})$/, ["id"], [ROLE_NIMASA_APPROVER, ROLE_EMPLOYER, ROLE_PSC_INSPECTOR, ROLE_AUDITOR, ROLE_SEAFARER], async (request) => {
+    "GET /v1/status-list/{id}": route(/^\/v1\/status-list\/([A-Za-z0-9._:-]{1,128})$/, ["id"], [ROLE_NIMASA_APPROVER, ROLE_EMPLOYER, ROLE_PSC_INSPECTOR, ROLE_AUDITOR, ROLE_SEAFARER], { resource: "status-list", action: "read", classification: "CONFIDENTIAL" }, async (request) => {
       const credential = await deps.service.statusListCredential(request.params["id"] ?? "");
       return { status: 200, body: credential };
     }),
-    "GET /v1/wallet/credentials/current": route(/^\/v1\/wallet\/credentials\/current$/, [], [ROLE_SEAFARER], async (request) => {
+    "GET /v1/wallet/credentials/current": route(/^\/v1\/wallet\/credentials\/current$/, [], [ROLE_SEAFARER], { resource: "wallet", action: "read", classification: "CONFIDENTIAL" }, async (request) => {
       const principal = assertPrincipal(request.principal);
       const credential = await deps.service.currentHolderCredential(principal.subject);
       if (credential === undefined) throw new ServiceError(404, "the authenticated holder has no current credential");
@@ -104,7 +115,7 @@ export function createHttpService(deps: HttpServiceDependencies): { server: Serv
       if (request.params["issuer"] !== key.issuer) throw new ServiceError(404, "issuer is unknown to this service");
       return { status: 200, body: { issuer: key.issuer, kid: key.kid, public_key_hex: key.publicKeyHex } };
     }),
-    "POST /v1/revoke": route(/^\/v1\/revoke$/, [], [ROLE_NIMASA_APPROVER], async (request) => {
+    "POST /v1/revoke": route(/^\/v1\/revoke$/, [], [ROLE_NIMASA_APPROVER], { resource: "credential", action: "revoke", classification: "CONFIDENTIAL" }, async (request) => {
       const body = assertObject(request.body);
       const principal = assertPrincipal(request.principal);
       const result = await deps.service.revokeCredential({
@@ -119,7 +130,7 @@ export function createHttpService(deps: HttpServiceDependencies): { server: Serv
 
   const server = createServer(async (request, response) => {
     try {
-      await dispatch(request, response, routes, deps.authenticator, metrics);
+      await dispatch(request, response, routes, deps.authenticator, deps.policyEngine, metrics);
     } catch (error) {
       writeError(response, error);
     }
@@ -131,9 +142,13 @@ function route(
   pattern: RegExp,
   paramNames: string[],
   roles: readonly PrincipalRole[] | null,
-  handler: Route["handler"],
+  policyOrHandler: RoutePolicy | Route["handler"],
+  maybeHandler?: Route["handler"],
 ): Route {
-  return { pattern, paramNames, roles, handler };
+  if (maybeHandler === undefined) {
+    return { pattern, paramNames, roles, handler: policyOrHandler as Route["handler"] };
+  }
+  return { pattern, paramNames, roles, policy: policyOrHandler as RoutePolicy, handler: maybeHandler };
 }
 
 async function dispatch(
@@ -141,6 +156,7 @@ async function dispatch(
   response: ServerResponse,
   routes: Record<string, Route>,
   authenticator: KeycloakAuthenticator,
+  policyEngine: PolicyEngine,
   metrics: MetricsRegistry,
 ): Promise<void> {
   const method = request.method ?? "GET";
@@ -167,6 +183,24 @@ async function dispatch(
         return;
       }
       throw error;
+    }
+    if (selected.policy !== undefined) {
+      // Embedded PBAC: deny-by-default policy evaluation on the authenticated
+      // route; a route without a matching allow-rule is refused even when the
+      // static role table admits the caller.
+      const decision = policyEngine.evaluate({
+        roles: principal.roles,
+        clearance: principal.clearance,
+        tenant: principal.tenant,
+        resource: selected.policy.resource,
+        action: selected.policy.action,
+        classification: selected.policy.classification,
+      });
+      if (!decision.allowed) {
+        metrics.increment("blueeconomy_pbac_denied_total", { route: key, resource: selected.policy.resource, action: selected.policy.action });
+        writeJson(response, 403, { error: "denied by policy" });
+        return;
+      }
     }
   }
   const match = selected.pattern.exec(path);

@@ -67,6 +67,13 @@ export interface StatusStore {
   getStatus(credentialId: string, issuer: string): Promise<StatusRecord | undefined>;
   listStatusBits(issuer: string, statusListId: string): Promise<StatusListBitRow[]>;
   /**
+   * Allocates the next revocation bit index for a status list. Implementations
+   * must guarantee uniqueness across restarts and concurrent replicas
+   * (the PostgreSQL store serializes on a per-list counter row) and fail
+   * closed when the bitstring range is exhausted.
+   */
+  allocateStatusListIndex(statusListId: string): Promise<number>;
+  /**
    * Returns the holder's current credentials: status ACTIVE and validUntil in
    * the future, most recently issued first. Revoked/suspended/expired
    * credentials are never returned (fail-closed for the wallet surface).

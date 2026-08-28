@@ -27,6 +27,10 @@ export const READ_ONLY_ROLES: ReadonlySet<PrincipalRole> = new Set([ROLE_AUDITOR
 export interface AuthenticatedPrincipal {
   subject: string;
   roles: ReadonlySet<PrincipalRole>;
+  /** Optional tenant binding consumed by the PBAC policy engine. */
+  tenant?: string | undefined;
+  /** Optional clearance claim consumed by the PBAC policy engine. */
+  clearance?: string | undefined;
 }
 
 export interface KeycloakAuthConfiguration {
@@ -61,7 +65,14 @@ export class KeycloakAuthenticator {
     if (typeof subject !== "string" || subject.trim().length === 0 || subject.length > 512) {
       throw new AuthenticationError("authenticated subject is required");
     }
-    return { subject, roles: extractApprovedRoles(verified.payload, this.configuration.roleClientIds) };
+    const tenant = verified.payload["tenant"];
+    const clearance = verified.payload["clearance"];
+    return {
+      subject,
+      roles: extractApprovedRoles(verified.payload, this.configuration.roleClientIds),
+      ...(typeof tenant === "string" && tenant.trim().length > 0 && tenant.length <= 128 ? { tenant } : {}),
+      ...(typeof clearance === "string" && clearance.trim().length > 0 && clearance.length <= 64 ? { clearance } : {}),
+    };
   }
 }
 

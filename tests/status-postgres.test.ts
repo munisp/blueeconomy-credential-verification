@@ -147,7 +147,7 @@ test("migration runner applies pending files once and is parameterized", async (
   const migrationsDirectory = join(new URL("..", import.meta.url).pathname, "migrations");
   const { executor, queries } = recordingExecutor(() => ({ rows: [] }));
   const applied = await runMigrations(executor, migrationsDirectory);
-  assert.deepEqual(applied, ["0001_credential_status", "0002_holder_credentials"]);
+  assert.deepEqual(applied, ["0001_credential_status", "0002_holder_credentials", "0003_status_list_allocator", "0004_revocation_terminal"]);
   const lookup = queries.find((query) => query.text.includes("FROM schema_migrations WHERE migration = $1"));
   assert.ok(lookup !== undefined && Array.isArray(lookup.params));
   const ddl = queries.find((query) => query.text.includes("CREATE TABLE credential_status"));
@@ -206,4 +206,126 @@ test("issuance documents are rejected on non-ACTIVE transitions", async () => {
     }),
     /issuance documents may only accompany an ACTIVE/,
   );
+});
+
+// ---------------------------------------------------------------------------
+// P0-A: durable status-list index allocation
+// ---------------------------------------------------------------------------
+
+test("status-list allocator uses the serialized per-list counter statement", async () => {
+  const { executor, queries } = recordingExecutor((query) =>
+    query.text.includes("status_list_allocator") ? { rows: [{ allocated_index: 41 }] } : { rows: [] });
+  const store = new PgStatusStore({ executor });
+  const index = await store.allocateStatusListIndex(entry.statusListId);
+  assert.equal(index, 41);
+  const allocation = queries.find((query) => query.text.includes("status_list_allocator"));
+  assert.ok(allocation !== undefined);
+  assert.ok(allocation.text.includes("ON CONFLICT (status_list_id) DO UPDATE"), "allocation must serialize on the counter row");
+  assert.ok(allocation.text.includes("next_index < 1048576"), "allocation must respect the bitstring bound");
+  assert.deepEqual(allocation.params, [entry.statusListId]);
+});
+
+test("concurrent allocations are unique and a restart resumes without collision", async () => {
+  // Simulate the database counter row: the INSERT .. ON CONFLICT DO UPDATE
+  // semantics are replayed against a shared map so allocator instances
+  // (i.e. restarts/replicas) share durable state.
+  const counters = new Map<string, number>();
+  const executorFactory = () => {
+    const executor: SqlExecutor = {
+      async query<Row extends import("pg").QueryResultRow>(text: string, params: readonly unknown[] = []) {
+        if (text.includes("status_list_allocator")) {
+          const statusListId = String(params[0]);
+          const current = counters.get(statusListId) ?? 0;
+          if (current >= 1_048_576) {
+            return { rows: [] as unknown as Row[], command: "", rowCount: 0, oid: 0, fields: [] };
+          }
+          counters.set(statusListId, current + 1);
+          return { rows: [{ allocated_index: current }] as unknown as Row[], command: "", rowCount: 1, oid: 0, fields: [] };
+        }
+        return { rows: [] as unknown as Row[], command: "", rowCount: 0, oid: 0, fields: [] };
+      },
+    };
+    return executor;
+  };
+  // "Replica A" allocates, a "restart" replaces the store instance, then
+  // "replica B" allocates concurrently; indices must be globally unique.
+  const replicaA = new PgStatusStore({ executor: executorFactory() });
+  const first = await Promise.all([...Array(8)].map(() => replicaA.allocateStatusListIndex(entry.statusListId)));
+  const replicaB = new PgStatusStore({ executor: executorFactory() });
+  const second = await Promise.all([...Array(8)].map(() => replicaB.allocateStatusListIndex(entry.statusListId)));
+  const all = [...first, ...second];
+  assert.equal(new Set(all).size, all.length, "every allocation must be unique across restarts and replicas");
+  assert.deepEqual([...all].sort((a, b) => a - b), [...Array(16).keys()]);
+});
+
+test("status-list allocator fails closed on exhaustion and out-of-range rows", async () => {
+  const exhausted = new PgStatusStore({ executor: recordingExecutor().executor });
+  await assert.rejects(() => exhausted.allocateStatusListIndex(entry.statusListId), /exhausted/);
+  const { executor } = recordingExecutor((query) =>
+    query.text.includes("status_list_allocator") ? { rows: [{ allocated_index: -3 }] } : { rows: [] });
+  const outOfRange = new PgStatusStore({ executor });
+  await assert.rejects(() => outOfRange.allocateStatusListIndex(entry.statusListId), /out-of-range/);
+  await assert.rejects(() => exhausted.allocateStatusListIndex("bad list id!"), /canonical/);
+});
+
+// ---------------------------------------------------------------------------
+// P0-B: revocation is terminal and the outbox cannot swallow transitions
+// ---------------------------------------------------------------------------
+
+test("the status upsert is guarded so REVOKED rows cannot transition", async () => {
+  const { executor, queries } = recordingExecutor((query) => {
+    if (query.text.includes("INSERT INTO credential_status")) return { rows: [] };
+    if (query.text.includes("SELECT status")) return { rows: [{ status: "REVOKED" }] };
+    return { rows: [] };
+  });
+  const store = new PgStatusStore({ executor });
+  await assert.rejects(
+    () => store.setStatus({ ...entry, status: "ACTIVE", reason: "re-issued" }, { ...outbox, topic: "seafarer.credential.v1" }),
+    /REVOKED is terminal/,
+  );
+  const upsert = queries.find((query) => query.text.includes("INSERT INTO credential_status"));
+  assert.ok(upsert !== undefined && upsert.text.includes("WHERE credential_status.status <> 'REVOKED'"), "upsert must refuse REVOKED rows");
+  assert.ok(queries.some((query) => query.text === "ROLLBACK"), "the refused transition must roll back");
+});
+
+test("outbox dedup accepts an identical replay but never swallows a new transition", async () => {
+  // Identical replay: conflict with the same stored content is a no-op.
+  const replay = recordingExecutor((query) => {
+    if (query.text.includes("INSERT INTO credential_status")) return { rows: [statusRowTemplate()] };
+    if (query.text.includes("INSERT INTO credential_outbox")) return { rows: [] };
+    if (query.text.includes("FROM credential_outbox")) {
+      return { rows: [{ topic: outbox.topic, payload_text: JSON.stringify(outbox.payload) }] };
+    }
+    return { rows: [] };
+  });
+  const replayStore = new PgStatusStore({ executor: replay.executor });
+  await replayStore.setStatus({ ...entry, status: "ACTIVE", reason: "issued" }, outbox);
+
+  // Conflicting payload under the same event id: a swallowed transition — fail.
+  const conflict = recordingExecutor((query) => {
+    if (query.text.includes("INSERT INTO credential_status")) return { rows: [statusRowTemplate()] };
+    if (query.text.includes("INSERT INTO credential_outbox")) return { rows: [] };
+    if (query.text.includes("FROM credential_outbox")) {
+      return { rows: [{ topic: outbox.topic, payload_text: JSON.stringify({ envelopeVersion: "0.9" }) }] };
+    }
+    return { rows: [] };
+  });
+  const conflictStore = new PgStatusStore({ executor: conflict.executor });
+  await assert.rejects(
+    () => conflictStore.setStatus({ ...entry, status: "ACTIVE", reason: "issued" }, outbox),
+    /refusing to swallow a state transition/,
+  );
+  assert.ok(conflict.queries.some((query) => query.text === "ROLLBACK"));
+});
+
+test("enqueueOutboxMessage verifies dedup conflicts the same way", async () => {
+  const { enqueueOutboxMessage } = await import("../src/status/postgres.js");
+  const { executor } = recordingExecutor((query) => {
+    if (query.text.includes("INSERT INTO credential_outbox")) return { rows: [] };
+    if (query.text.includes("FROM credential_outbox")) {
+      return { rows: [{ topic: "seafarer.credential.v1", payload_text: "{}" }] };
+    }
+    return { rows: [] };
+  });
+  await assert.rejects(() => enqueueOutboxMessage(executor, outbox), /refusing to swallow/);
 });
