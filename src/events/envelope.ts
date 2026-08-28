@@ -1,6 +1,6 @@
-import { createHash, sign as ed25519Sign, type KeyObject } from "node:crypto";
+import { createHash, sign as ed25519Sign, verify as ed25519Verify, type KeyObject } from "node:crypto";
 import { canonicalizeJson, asJsonValue, type JsonValue } from "../vc/jcs.js";
-import { encodeBase58Btc } from "../vc/multibase.js";
+import { decodeBase58Btc, encodeBase58Btc } from "../vc/multibase.js";
 
 /**
  * Blue Economy platform event envelope (envelopeVersion 1.0). The payload is
@@ -40,11 +40,16 @@ export interface PlatformEnvelope {
   occurredAt: string;
   producer: string;
   correlationId: string;
-  message: Record<string, JsonValue>;
+  /** Canonical platform key carrying the FHIR R4 message Bundle. */
+  fhir: Record<string, JsonValue>;
   provenance: {
     principalId: string;
     principalRole: string;
-    signature: { algorithm: "ed25519-sha256-jcs"; digestSha256: string; value: string };
+    /**
+     * Multibase base58btc Ed25519 signature over the SHA-256 digest of the
+     * JCS-canonical envelope payload (everything except `provenance`).
+     */
+    signature: string;
     ledgerCommitHash: string;
   };
   classification: typeof ENVELOPE_CLASSIFICATION;
@@ -68,7 +73,7 @@ export function buildPlatformEnvelope(input: EnvelopeInput): PlatformEnvelope {
   }
 
   const eventId = deterministicEventId(input.eventType, input.deduplicationKey);
-  const message: Record<string, JsonValue> = {
+  const fhir: Record<string, JsonValue> = {
     resourceType: "Bundle",
     type: "message",
     timestamp: occurredAt,
@@ -81,11 +86,11 @@ export function buildPlatformEnvelope(input: EnvelopeInput): PlatformEnvelope {
     occurredAt,
     producer: input.producer,
     correlationId: input.correlationId,
-    message,
+    fhir,
     classification: ENVELOPE_CLASSIFICATION,
   };
-  const digestSha256 = createHash("sha256").update(canonicalizeJson(asJsonValue(payload)), "utf8").digest("hex");
-  const signature = ed25519Sign(null, Buffer.from(digestSha256, "hex"), input.signingKey);
+  const digest = createHash("sha256").update(canonicalizeJson(asJsonValue(payload)), "utf8").digest();
+  const signature = ed25519Sign(null, digest, input.signingKey);
   return {
     envelopeVersion: ENVELOPE_VERSION,
     eventId,
@@ -93,11 +98,11 @@ export function buildPlatformEnvelope(input: EnvelopeInput): PlatformEnvelope {
     occurredAt,
     producer: input.producer,
     correlationId: input.correlationId,
-    message,
+    fhir,
     provenance: {
       principalId: input.principal.principalId,
       principalRole: input.principal.principalRole,
-      signature: { algorithm: "ed25519-sha256-jcs", digestSha256, value: encodeBase58Btc(signature) },
+      signature: encodeBase58Btc(signature),
       ledgerCommitHash: input.ledgerCommitHash,
     },
     classification: ENVELOPE_CLASSIFICATION,
@@ -107,8 +112,20 @@ export function buildPlatformEnvelope(input: EnvelopeInput): PlatformEnvelope {
 /** Verifies the provenance signature without network access. */
 export function verifyEnvelopeProvenance(envelope: PlatformEnvelope, publicKey: KeyObject): void {
   const { provenance, ...payload } = envelope;
-  const digestSha256 = createHash("sha256").update(canonicalizeJson(asJsonValue(payload as unknown as Record<string, JsonValue>)), "utf8").digest("hex");
-  if (digestSha256 !== provenance.signature.digestSha256) {
+  const digest = createHash("sha256").update(canonicalizeJson(asJsonValue(payload as unknown as Record<string, JsonValue>)), "utf8").digest();
+  let signature: Buffer;
+  try {
+    signature = Buffer.from(decodeBase58Btc(provenance.signature));
+  } catch {
+    throw new Error("envelope provenance signature is not valid multibase base58btc");
+  }
+  let valid = false;
+  try {
+    valid = ed25519Verify(null, digest, publicKey, signature);
+  } catch {
+    valid = false;
+  }
+  if (!valid) {
     throw new Error("envelope provenance digest does not match the canonical payload");
   }
 }

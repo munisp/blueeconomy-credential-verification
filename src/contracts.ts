@@ -90,7 +90,7 @@ export const PLATFORM_ENVELOPE_SCHEMA: JsonSchemaDocument = {
   title: "Blue Economy Platform Event Envelope",
   type: "object",
   additionalProperties: false,
-  required: ["envelopeVersion", "eventId", "eventType", "occurredAt", "producer", "correlationId", "message", "provenance", "classification"],
+  required: ["envelopeVersion", "eventId", "eventType", "occurredAt", "producer", "correlationId", "fhir", "provenance", "classification"],
   properties: {
     envelopeVersion: { const: "1.0" },
     eventId: { type: "string", pattern: "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$" },
@@ -98,7 +98,7 @@ export const PLATFORM_ENVELOPE_SCHEMA: JsonSchemaDocument = {
     occurredAt: { type: "string", format: "date-time" },
     producer: { type: "string", minLength: 1, maxLength: 128 },
     correlationId: { type: "string", minLength: 1, maxLength: 128 },
-    message: {
+    fhir: {
       type: "object",
       required: ["resourceType", "type", "entry"],
       properties: {
@@ -115,16 +115,7 @@ export const PLATFORM_ENVELOPE_SCHEMA: JsonSchemaDocument = {
       properties: {
         principalId: { type: "string", minLength: 1, maxLength: 256 },
         principalRole: { type: "string", minLength: 1, maxLength: 128 },
-        signature: {
-          type: "object",
-          additionalProperties: false,
-          required: ["algorithm", "digestSha256", "value"],
-          properties: {
-            algorithm: { const: "ed25519-sha256-jcs" },
-            digestSha256: { type: "string", pattern: SHA256_HEX },
-            value: { type: "string", pattern: "^z[1-9A-HJ-NP-Za-km-z]+$", description: "Multibase base58btc Ed25519 signature over the SHA-256 digest of the JCS-canonical envelope payload." },
-          },
-        },
+        signature: { type: "string", pattern: "^z[1-9A-HJ-NP-Za-km-z]+$", description: "Multibase base58btc Ed25519 signature over the SHA-256 digest of the JCS-canonical envelope payload." },
         ledgerCommitHash: { type: "string", pattern: SHA256_HEX },
       },
     },

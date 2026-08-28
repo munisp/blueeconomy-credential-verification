@@ -11,7 +11,7 @@
     "occurredAt",
     "producer",
     "correlationId",
-    "message",
+    "fhir",
     "provenance",
     "classification"
   ],
@@ -43,7 +43,7 @@
       "minLength": 1,
       "maxLength": 128
     },
-    "message": {
+    "fhir": {
       "type": "object",
       "required": [
         "resourceType",
@@ -88,27 +88,9 @@
           "maxLength": 128
         },
         "signature": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": [
-            "algorithm",
-            "digestSha256",
-            "value"
-          ],
-          "properties": {
-            "algorithm": {
-              "const": "ed25519-sha256-jcs"
-            },
-            "digestSha256": {
-              "type": "string",
-              "pattern": "^[0-9a-f]{64}$"
-            },
-            "value": {
-              "type": "string",
-              "pattern": "^z[1-9A-HJ-NP-Za-km-z]+$",
-              "description": "Multibase base58btc Ed25519 signature over the SHA-256 digest of the JCS-canonical envelope payload."
-            }
-          }
+          "type": "string",
+          "pattern": "^z[1-9A-HJ-NP-Za-km-z]+$",
+          "description": "Multibase base58btc Ed25519 signature over the SHA-256 digest of the JCS-canonical envelope payload."
         },
         "ledgerCommitHash": {
           "type": "string",

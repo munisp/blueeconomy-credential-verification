@@ -1,5 +1,5 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { AuthenticationError, AuthorizationError, authorizeRequest, type AuthenticatedPrincipal, type KeycloakAuthenticator, type PrincipalRole, ROLE_AUDITOR, ROLE_EMPLOYER, ROLE_NIMASA_APPROVER, ROLE_PSC_INSPECTOR } from "../auth/keycloak.js";
+import { AuthenticationError, AuthorizationError, authorizeRequest, type AuthenticatedPrincipal, type KeycloakAuthenticator, type PrincipalRole, ROLE_AUDITOR, ROLE_EMPLOYER, ROLE_NIMASA_APPROVER, ROLE_PSC_INSPECTOR, ROLE_SEAFARER } from "../auth/keycloak.js";
 import { CredentialService, ServiceError } from "../service/credential-service.js";
 import type { StatusStore } from "../status/store.js";
 
@@ -88,9 +88,21 @@ export function createHttpService(deps: HttpServiceDependencies): { server: Serv
       metrics.increment("blueeconomy_vc_verified_total");
       return { status: 200, body: result };
     }),
-    "GET /v1/status-list/{id}": route(/^\/v1\/status-list\/([A-Za-z0-9._:-]{1,128})$/, ["id"], [ROLE_NIMASA_APPROVER, ROLE_EMPLOYER, ROLE_PSC_INSPECTOR, ROLE_AUDITOR], async () => {
-      const credential = await deps.service.currentStatusListCredential();
+    "GET /v1/status-list/{id}": route(/^\/v1\/status-list\/([A-Za-z0-9._:-]{1,128})$/, ["id"], [ROLE_NIMASA_APPROVER, ROLE_EMPLOYER, ROLE_PSC_INSPECTOR, ROLE_AUDITOR, ROLE_SEAFARER], async (request) => {
+      const credential = await deps.service.statusListCredential(request.params["id"] ?? "");
       return { status: 200, body: credential };
+    }),
+    "GET /v1/wallet/credentials/current": route(/^\/v1\/wallet\/credentials\/current$/, [], [ROLE_SEAFARER], async (request) => {
+      const principal = assertPrincipal(request.principal);
+      const credential = await deps.service.currentHolderCredential(principal.subject);
+      if (credential === undefined) throw new ServiceError(404, "the authenticated holder has no current credential");
+      metrics.increment("blueeconomy_vc_wallet_served_total");
+      return { status: 200, body: credential };
+    }),
+    "GET /v1/issuers/{issuer}/key": route(/^\/v1\/issuers\/([A-Za-z0-9._:%-]{1,384})\/key$/, ["issuer"], null, async (request) => {
+      const key = deps.service.issuerKeyMaterial();
+      if (request.params["issuer"] !== key.issuer) throw new ServiceError(404, "issuer is unknown to this service");
+      return { status: 200, body: { issuer: key.issuer, kid: key.kid, public_key_hex: key.publicKeyHex } };
     }),
     "POST /v1/revoke": route(/^\/v1\/revoke$/, [], [ROLE_NIMASA_APPROVER], async (request) => {
       const body = assertObject(request.body);

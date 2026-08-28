@@ -8,15 +8,17 @@ import { createRemoteJWKSet, jwtVerify, type JWTVerifyGetKey, type JWTPayload } 
  * claim means no access.
  */
 
-export type PrincipalRole = "nimasa-approver" | "employer" | "psc-inspector" | "auditor";
+export type PrincipalRole = "nimasa-approver" | "employer" | "psc-inspector" | "auditor" | "seafarer";
 
 export const ROLE_NIMASA_APPROVER: PrincipalRole = "nimasa-approver";
 export const ROLE_EMPLOYER: PrincipalRole = "employer";
 export const ROLE_PSC_INSPECTOR: PrincipalRole = "psc-inspector";
 export const ROLE_AUDITOR: PrincipalRole = "auditor";
+/** Credential holder (wallet) role: reads only its own credentials. */
+export const ROLE_SEAFARER: PrincipalRole = "seafarer";
 
 export const APPROVED_ROLES: readonly PrincipalRole[] = [
-  ROLE_NIMASA_APPROVER, ROLE_EMPLOYER, ROLE_PSC_INSPECTOR, ROLE_AUDITOR,
+  ROLE_NIMASA_APPROVER, ROLE_EMPLOYER, ROLE_PSC_INSPECTOR, ROLE_AUDITOR, ROLE_SEAFARER,
 ];
 
 /** Read-only oversight role: denied every mutating route generically. */

@@ -29,8 +29,10 @@ Worker configuration (all fail-closed unless noted): `BLUEECONOMY_TEMPORAL_ADDRE
 | --- | --- |
 | `POST /v1/credentials` | `nimasa-approver` |
 | `POST /v1/verify` | `employer`, `psc-inspector` |
-| `GET /v1/status-list/{id}` | any approved role (incl. `auditor`) |
+| `GET /v1/status-list/{id}` | any approved role (incl. `auditor`, `seafarer`); 404 unless `{id}` matches the configured status-list credential id |
 | `POST /v1/revoke` | `nimasa-approver` |
+| `GET /v1/wallet/credentials/current` | `seafarer` (returns the authenticated holder's current ACTIVE, non-expired VC document; 404 when none) |
+| `GET /v1/issuers/{issuer}/key` | public (issuer Ed25519 public key as `{ issuer, kid, public_key_hex }` for offline eddsa-jcs-2022 verification; 404 for unknown issuers) |
 | `GET /healthz` `GET /readyz` `GET /metrics` | unauthenticated probes |
 
 Authentication is Keycloak RS256 via JWKS (`jose`), ported from `blueeconomy-administration-service/internal/admin`: roles are read from `realm_access.roles` and configured `resource_access[client].roles`; the authorizer is fail-closed (roleless identities denied, `auditor` denied every mutation, unknown routes 404).

@@ -122,6 +122,11 @@ export class CredentialService {
       statusListId: this.deps.statusListId,
       statusListIndex,
       effectiveAt: now,
+      issuance: {
+        holderId: input.holderId,
+        document: credential as unknown as Record<string, unknown>,
+        validUntil,
+      },
     }, outbox);
     return { credential, eventId: envelope.eventId, ledgerCommitHash: commit.commitHash };
   }
@@ -178,6 +183,50 @@ export class CredentialService {
       effectiveAt: now,
     }, { topic: "seafarer.revocation.v1", eventId: envelope.eventId, payload: envelope as unknown as Record<string, unknown> });
     return { eventId: envelope.eventId, ledgerCommitHash: commit.commitHash };
+  }
+
+  /**
+   * Returns the authenticated holder's current valid credential (ACTIVE,
+   * non-expired), most recently issued first. Undefined when the holder has
+   * none; the HTTP edge maps that to 404 so the wallet keeps its cache.
+   */
+  public async currentHolderCredential(holderSubject: string): Promise<SeafarerCoCCredential | undefined> {
+    if (holderSubject.trim().length === 0) throw new ServiceError(400, "holder subject is required");
+    const records = await this.deps.statusStore.listCurrentHolderCredentials(holderSubject, this.deps.issuer.issuerDid);
+    const first = records[0];
+    return first === undefined ? undefined : (first.document as unknown as SeafarerCoCCredential);
+  }
+
+  /**
+   * Serves the signed status-list snapshot only when the requested id matches
+   * the configured status-list credential id (or its trailing path segment,
+   * which is how the singular route is addressed); anything else is a 404.
+   */
+  public async statusListCredential(requestedId: string): Promise<BitstringStatusListCredential> {
+    if (!this.isConfiguredStatusListId(requestedId)) {
+      throw new ServiceError(404, "status list is unknown to this issuer");
+    }
+    return this.currentStatusListCredential();
+  }
+
+  /** Public issuer key material for offline eddsa-jcs-2022 verification. */
+  public issuerKeyMaterial(): { issuer: string; kid: string; publicKeyHex: string } {
+    const jwk = createPublicKey(this.deps.issuer.privateKey).export({ format: "jwk" });
+    const x = (jwk as { x?: string }).x;
+    if (typeof x !== "string") throw new ServiceError(500, "issuer public key is unavailable");
+    return {
+      issuer: this.deps.issuer.issuerDid,
+      kid: this.deps.issuer.verificationMethod,
+      publicKeyHex: Buffer.from(x, "base64url").toString("hex"),
+    };
+  }
+
+  private isConfiguredStatusListId(requestedId: string): boolean {
+    const configured = this.deps.statusListId;
+    if (requestedId === configured) return true;
+    const segments = configured.split("/").filter((segment) => segment.length > 0);
+    const trailing = segments[segments.length - 1];
+    return trailing !== undefined && requestedId === trailing;
   }
 
   /** Builds and signs the current Bitstring Status List credential snapshot. */

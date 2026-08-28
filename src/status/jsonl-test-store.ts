@@ -5,6 +5,7 @@ import {
   assertStatusEntry,
   credentialIdReference,
   type CredentialStatus,
+  type HolderCredentialRecord,
   type StatusEntry,
   type StatusListBitRow,
   type StatusRecord,
@@ -39,6 +40,7 @@ export function createJsonlTestStatusStore(path: string, env: NodeJS.ProcessEnv)
   const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
   const registry = new StatusRegistry({ path, issuer, key: privateKey as never, algorithm: "RS256", keyId: "jsonl-test-key" });
   const placementByCredential = new Map<string, { statusListId: string; statusListIndex: number }>();
+  const holderCredentials = new Map<string, { holderId: string; document: Record<string, unknown>; validUntil: Date }>();
 
   async function readLines(): Promise<JsonlLine[]> {
     let content: string;
@@ -57,6 +59,13 @@ export function createJsonlTestStatusStore(path: string, env: NodeJS.ProcessEnv)
       const effectiveAt = entry.effectiveAt ?? new Date();
       const record = await registry.setStatus(entry.credentialId, entry.status, entry.reason, entry.updatedBy, effectiveAt);
       placementByCredential.set(entry.credentialId, { statusListId: entry.statusListId, statusListIndex: entry.statusListIndex });
+      if (entry.issuance !== undefined) {
+        holderCredentials.set(entry.credentialId, {
+          holderId: entry.issuance.holderId,
+          document: entry.issuance.document,
+          validUntil: entry.issuance.validUntil,
+        });
+      }
       return {
         credentialIdReferenceSha256: record.claims.credential_id_reference_sha256,
         issuer: record.claims.issuer,
@@ -106,6 +115,22 @@ export function createJsonlTestStatusStore(path: string, env: NodeJS.ProcessEnv)
         }
       }
       return rows.sort((left, right) => left.statusListIndex - right.statusListIndex);
+    },
+    async listCurrentHolderCredentials(holderId: string, requestedIssuer: string): Promise<HolderCredentialRecord[]> {
+      if (requestedIssuer !== issuer) return [];
+      const latestByReference = new Map<string, CredentialStatus>();
+      for (const line of await readLines()) {
+        latestByReference.set(line.claims.credential_id_reference_sha256, line.claims.status);
+      }
+      const now = Date.now();
+      const records: HolderCredentialRecord[] = [];
+      for (const [credentialId, held] of [...holderCredentials.entries()].reverse()) {
+        if (held.holderId !== holderId) continue;
+        if (held.validUntil.getTime() <= now) continue;
+        if (latestByReference.get(credentialIdReference(credentialId)) !== "ACTIVE") continue;
+        records.push({ document: held.document, validUntil: held.validUntil.toISOString() });
+      }
+      return records;
     },
     async healthCheck(): Promise<void> {
       // File-backed test store has no liveness dependency.

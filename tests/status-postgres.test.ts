@@ -147,9 +147,63 @@ test("migration runner applies pending files once and is parameterized", async (
   const migrationsDirectory = join(new URL("..", import.meta.url).pathname, "migrations");
   const { executor, queries } = recordingExecutor(() => ({ rows: [] }));
   const applied = await runMigrations(executor, migrationsDirectory);
-  assert.deepEqual(applied, ["0001_credential_status"]);
+  assert.deepEqual(applied, ["0001_credential_status", "0002_holder_credentials"]);
   const lookup = queries.find((query) => query.text.includes("FROM schema_migrations WHERE migration = $1"));
   assert.ok(lookup !== undefined && Array.isArray(lookup.params));
   const ddl = queries.find((query) => query.text.includes("CREATE TABLE credential_status"));
   assert.ok(ddl !== undefined && ddl.params.length === 0, "migration DDL must not interpolate values");
+  const holderDdl = queries.find((query) => query.text.includes("CREATE TABLE holder_credentials"));
+  assert.ok(holderDdl !== undefined && holderDdl.params.length === 0, "holder credential DDL must not interpolate values");
+});
+
+test("issuance persists the holder credential document atomically with the status upsert", async () => {
+  const issuanceEntry: StatusEntry = {
+    ...entry,
+    status: "ACTIVE",
+    reason: "issued",
+    issuance: {
+      holderId: "principal-01",
+      document: { id: entry.credentialId, type: ["VerifiableCredential", "SeafarerCoC"] },
+      validUntil: new Date("2031-01-01T00:00:00.000Z"),
+    },
+  };
+  const { executor, queries } = recordingExecutor((query) =>
+    query.text.includes("RETURNING") ? { rows: [statusRowTemplate()] } : { rows: [] });
+  const store = new PgStatusStore({ executor });
+  await store.setStatus(issuanceEntry, { ...outbox, topic: "seafarer.credential.v1" });
+  assert.equal(queries[0]?.text, "BEGIN");
+  const holderInsert = queries.find((query) => query.text.includes("INSERT INTO holder_credentials"));
+  assert.ok(holderInsert, "expected a holder_credentials insert in the same transaction");
+  assert.equal(holderInsert.params[1], "principal-01");
+  assert.equal(holderInsert.params[2], entry.issuer);
+  assert.match(String(holderInsert.params[4]), /^2031-01-01/);
+  assert.ok(holderInsert.text.includes("$4::jsonb"), "document must be bound as a parameter, never interpolated");
+  assert.equal(queries.at(-1)?.text, "COMMIT");
+});
+
+test("holder credential lookup filters to ACTIVE, non-expired rows with bound parameters", async () => {
+  const { executor, queries } = recordingExecutor(() => ({
+    rows: [{ credential_document: { id: "urn:uuid:x" }, valid_until: new Date("2031-01-01T00:00:00.000Z") }],
+  }));
+  const store = new PgStatusStore({ executor });
+  const records = await store.listCurrentHolderCredentials("principal-01", entry.issuer);
+  assert.equal(records.length, 1);
+  assert.equal(records[0]?.validUntil, "2031-01-01T00:00:00.000Z");
+  const lookup = queries[0];
+  assert.ok(lookup !== undefined);
+  assert.ok(lookup.text.includes("FROM holder_credentials"));
+  assert.ok(lookup.text.includes("s.status = 'ACTIVE'") && lookup.text.includes("h.valid_until > now()"));
+  assert.deepEqual(lookup.params, ["principal-01", entry.issuer]);
+});
+
+test("issuance documents are rejected on non-ACTIVE transitions", async () => {
+  const { executor } = recordingExecutor();
+  const store = new PgStatusStore({ executor });
+  await assert.rejects(
+    () => store.setStatus({
+      ...entry,
+      issuance: { holderId: "principal-01", document: { id: "x" }, validUntil: new Date("2031-01-01T00:00:00.000Z") },
+    }),
+    /issuance documents may only accompany an ACTIVE/,
+  );
 });

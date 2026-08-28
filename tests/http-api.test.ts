@@ -6,7 +6,7 @@ import { join } from "node:path";
 import type { AddressInfo } from "node:net";
 import { SignJWT, createLocalJWKSet, exportJWK, generateKeyPair } from "jose";
 
-import { KeycloakAuthenticator, authorizeRequest, AuthorizationError, ROLE_AUDITOR, ROLE_EMPLOYER, ROLE_NIMASA_APPROVER, ROLE_PSC_INSPECTOR, type PrincipalRole } from "../src/auth/keycloak.js";
+import { KeycloakAuthenticator, authorizeRequest, AuthorizationError, ROLE_AUDITOR, ROLE_EMPLOYER, ROLE_NIMASA_APPROVER, ROLE_PSC_INSPECTOR, ROLE_SEAFARER, type PrincipalRole } from "../src/auth/keycloak.js";
 import { createHttpService } from "../src/http/server.js";
 import { CredentialService } from "../src/service/credential-service.js";
 import { createJsonlTestStatusStore } from "../src/status/jsonl-test-store.js";
@@ -22,7 +22,7 @@ const OIDC_AUDIENCE = "credential-verification";
 interface Harness {
   baseUrl: string;
   close(): Promise<void>;
-  token(roles: PrincipalRole[]): Promise<string>;
+  token(roles: PrincipalRole[], subject?: string): Promise<string>;
 }
 
 async function startHarness(): Promise<Harness> {
@@ -93,12 +93,12 @@ async function startHarness(): Promise<Harness> {
       await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
       await statusStore.close();
     },
-    async token(roles: PrincipalRole[]) {
+    async token(roles: PrincipalRole[], subject = "principal-01") {
       return new SignJWT({ realm_access: { roles } })
         .setProtectedHeader({ alg: "RS256", kid: "keycloak-test-key" })
         .setIssuer(OIDC_ISSUER)
         .setAudience(OIDC_AUDIENCE)
-        .setSubject("principal-01")
+        .setSubject(subject)
         .setIssuedAt()
         .setExpirationTime("5m")
         .sign(oidcKey);
@@ -224,6 +224,75 @@ test("issuer and verifier HTTP surface with role matrix", async (t) => {
     assert.equal(statusList.status, 200);
     assert.deepEqual((statusList.body as Record<string, unknown>)["type"], ["VerifiableCredential", "BitstringStatusListCredential"]);
     assert.ok((statusList.body as Record<string, unknown>)["proof"] !== undefined);
+  });
+});
+
+test("wallet, issuer-key and status-list-id contract for the mobile app", async (t) => {
+  const harness = await startHarness();
+  t.after(() => harness.close());
+
+  const holderSubject = "principal-01";
+  let credentialId = "";
+
+  await t.test("status-list route rejects unknown ids fail-closed", async () => {
+    const token = await harness.token([ROLE_AUDITOR]);
+    const missing = await get(harness.baseUrl, "/v1/status-list/bogus", token);
+    assert.equal(missing.status, 404);
+    const known = await get(harness.baseUrl, "/v1/status-list/main", token);
+    assert.equal(known.status, 200);
+  });
+
+  await t.test("wallet endpoint requires the seafarer role", async () => {
+    assert.equal((await get(harness.baseUrl, "/v1/wallet/credentials/current")).status, 401);
+    const employer = await harness.token([ROLE_EMPLOYER]);
+    assert.equal((await get(harness.baseUrl, "/v1/wallet/credentials/current", employer)).status, 403);
+  });
+
+  await t.test("wallet endpoint 404s before the holder has any credential", async () => {
+    const seafarer = await harness.token([ROLE_SEAFARER], holderSubject);
+    assert.equal((await get(harness.baseUrl, "/v1/wallet/credentials/current", seafarer)).status, 404);
+  });
+
+  await t.test("holder fetches exactly the issued credential document", async () => {
+    const approver = await harness.token([ROLE_NIMASA_APPROVER]);
+    const issued = await post(harness.baseUrl, "/v1/credentials", { ...ISSUE_BODY, holderId: holderSubject }, approver);
+    assert.equal(issued.status, 201);
+    const credential = issued.body["credential"] as Record<string, unknown>;
+    credentialId = String(credential["id"]);
+
+    const seafarer = await harness.token([ROLE_SEAFARER], holderSubject);
+    const wallet = await get(harness.baseUrl, "/v1/wallet/credentials/current", seafarer);
+    assert.equal(wallet.status, 200);
+    // The mobile fetcher parses the body directly as the VC document.
+    assert.equal(wallet.body["id"], credentialId);
+    assert.equal(wallet.body["issuer"], ISSUER_DID);
+    assert.equal((wallet.body["credentialSubject"] as Record<string, unknown>)["id"], holderSubject);
+    assert.ok(wallet.body["proof"] !== undefined);
+
+    const otherHolder = await harness.token([ROLE_SEAFARER], "principal-02");
+    assert.equal((await get(harness.baseUrl, "/v1/wallet/credentials/current", otherHolder)).status, 404);
+  });
+
+  await t.test("revoked credentials disappear from the wallet surface", async () => {
+    const approver = await harness.token([ROLE_NIMASA_APPROVER]);
+    const revoked = await post(harness.baseUrl, "/v1/revoke", {
+      credentialId,
+      holderId: holderSubject,
+      reason: "certificate withdrawn",
+    }, approver);
+    assert.equal(revoked.status, 200);
+    const seafarer = await harness.token([ROLE_SEAFARER], holderSubject);
+    assert.equal((await get(harness.baseUrl, "/v1/wallet/credentials/current", seafarer)).status, 404);
+  });
+
+  await t.test("issuer key endpoint is public and serves the Ed25519 key", async () => {
+    const key = await get(harness.baseUrl, `/v1/issuers/${encodeURIComponent(ISSUER_DID)}/key`);
+    assert.equal(key.status, 200);
+    assert.equal(key.body["issuer"], ISSUER_DID);
+    assert.equal(key.body["kid"], `${ISSUER_DID}#ed25519-key-1`);
+    assert.match(String(key.body["public_key_hex"]), /^[0-9a-f]{64}$/);
+    const unknown = await get(harness.baseUrl, `/v1/issuers/${encodeURIComponent("did:web:unknown.example")}/key`);
+    assert.equal(unknown.status, 404);
   });
 });
 

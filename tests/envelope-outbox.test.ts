@@ -24,12 +24,22 @@ test("envelope is deterministic, signed and CONFIDENTIAL", () => {
   assert.equal(first.envelopeVersion, "1.0");
   assert.equal(first.classification, "CONFIDENTIAL");
   assert.equal(first.provenance.ledgerCommitHash, "b".repeat(64));
-  assert.equal((first.message as { resourceType: string }).resourceType, "Bundle");
+  assert.equal((first.fhir as { resourceType: string }).resourceType, "Bundle");
+  assert.equal((first.fhir as { type: string }).type, "message");
+  assert.ok(!("message" in first), "platform canonical envelope carries the bundle under 'fhir'");
+  assert.match(first.provenance.signature, /^z[1-9A-HJ-NP-Za-km-z]+$/, "provenance signature must be a base58btc string");
   assert.doesNotThrow(() => verifyEnvelopeProvenance(first, publicKey));
 
   const tampered = JSON.parse(JSON.stringify(first)) as typeof first;
   tampered.correlationId = "corr-9999";
   assert.throws(() => verifyEnvelopeProvenance(tampered, publicKey), /digest does not match/);
+
+  const wrongKey = generateEphemeralIssuerKeyPair();
+  assert.throws(() => verifyEnvelopeProvenance(first, wrongKey.publicKey), /digest does not match/);
+
+  const malformed = JSON.parse(JSON.stringify(first)) as typeof first;
+  malformed.provenance.signature = "not-multibase";
+  assert.throws(() => verifyEnvelopeProvenance(malformed, publicKey), /not valid multibase base58btc/);
 });
 
 test("deterministic event ids differ across event types and keys", () => {

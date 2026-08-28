@@ -4,6 +4,7 @@ import pg from "pg";
 import {
   assertStatusEntry,
   credentialIdReference,
+  type HolderCredentialRecord,
   type OutboxMessage,
   type StatusEntry,
   type StatusListBitRow,
@@ -56,6 +57,22 @@ INSERT INTO credential_outbox (topic, event_id, payload)
 VALUES ($1, $2, $3::jsonb)
 ON CONFLICT (event_id) DO NOTHING`;
 
+const INSERT_HOLDER_CREDENTIAL = `
+INSERT INTO holder_credentials (
+  credential_id_reference_sha256, holder_id, issuer, credential_document, valid_until
+) VALUES ($1, $2, $3, $4::jsonb, $5)
+ON CONFLICT (credential_id_reference_sha256) DO NOTHING`;
+
+const SELECT_CURRENT_HOLDER_CREDENTIALS = `
+SELECT h.credential_document, h.valid_until
+  FROM holder_credentials h
+  JOIN credential_status s
+    ON s.credential_id_reference_sha256 = h.credential_id_reference_sha256
+ WHERE h.holder_id = $1 AND h.issuer = $2
+   AND s.status = 'ACTIVE'
+   AND h.valid_until > now()
+ ORDER BY h.issued_at DESC, h.credential_id_reference_sha256 ASC`;
+
 export class PgStatusStore implements StatusStore {
   private readonly executor: SqlExecutor;
   private readonly onClose?: () => Promise<void>;
@@ -71,7 +88,7 @@ export class PgStatusStore implements StatusStore {
     const reference = credentialIdReference(entry.credentialId);
     const effectiveAt = (entry.effectiveAt ?? new Date()).toISOString();
     const client = this.executor;
-    const transactional = outbox !== undefined;
+    const transactional = outbox !== undefined || entry.issuance !== undefined;
     if (transactional) await client.query("BEGIN");
     try {
       const result = await client.query<StatusRow>(UPSERT_STATUS, [
@@ -80,6 +97,12 @@ export class PgStatusStore implements StatusStore {
       ]);
       const row = result.rows[0];
       if (row === undefined) throw new Error("status upsert returned no row");
+      if (entry.issuance !== undefined) {
+        await client.query(INSERT_HOLDER_CREDENTIAL, [
+          reference, entry.issuance.holderId, entry.issuer,
+          JSON.stringify(entry.issuance.document), entry.issuance.validUntil.toISOString(),
+        ]);
+      }
       if (outbox !== undefined) {
         await client.query(INSERT_OUTBOX, [outbox.topic, outbox.eventId, JSON.stringify(outbox.payload)]);
       }
@@ -119,6 +142,17 @@ export class PgStatusStore implements StatusStore {
       [issuer, statusListId],
     );
     return result.rows.map((row) => ({ statusListIndex: row.status_list_index, revoked: row.status === "REVOKED" }));
+  }
+
+  public async listCurrentHolderCredentials(holderId: string, issuer: string): Promise<HolderCredentialRecord[]> {
+    const result = await this.executor.query<{ credential_document: Record<string, unknown>; valid_until: Date } & pg.QueryResultRow>(
+      SELECT_CURRENT_HOLDER_CREDENTIALS,
+      [holderId, issuer],
+    );
+    return result.rows.map((row) => ({
+      document: row.credential_document,
+      validUntil: new Date(row.valid_until).toISOString(),
+    }));
   }
 
   public async healthCheck(): Promise<void> {
