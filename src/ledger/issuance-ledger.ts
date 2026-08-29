@@ -2,12 +2,15 @@ import { createHash } from "node:crypto";
 
 /**
  * TigerBeetle-backed issuance ledger behind a small interface. Every issuance
- * and revocation records a double-entry transfer from the NIMASA issuance
- * clearing account to the credential's account. Transfer IDs are deterministic
- * (SHA-256 of the credential reference + entry kind) so retries are
- * idempotent: TigerBeetle returns `exists` for an identical transfer and the
- * commit is treated as successful. The store fails closed when no TigerBeetle
- * cluster is configured.
+ * records a double-entry transfer from the NIMASA issuance clearing account
+ * to the credential's account; every revocation records the counter-entry in
+ * the reverse direction (debit the credential's account, credit the clearing
+ * account back), so the ledger balance of a revoked credential returns to
+ * zero instead of accumulating a second issuance-direction posting.
+ * Transfer IDs are deterministic (SHA-256 of the credential reference +
+ * entry kind) so retries are idempotent: TigerBeetle returns `exists` for an
+ * identical transfer and the commit is treated as successful. The store fails
+ * closed when no TigerBeetle cluster is configured.
  */
 
 export type LedgerEntryKind = "issuance" | "revocation";
@@ -49,7 +52,6 @@ const TB_CODE_ISSUANCE = 7101;
 const TB_CODE_REVOCATION = 7102;
 /** Account codes: 71xx range reserved for the seafarer credential ledger. */
 const NIMASA_CLEARING_ACCOUNT = 7_100_000_001n;
-const STATUS_ACCOUNT_BASE = 7_100_100_000n;
 
 // TigerBeetle CreateTransferStatus.exists === 21
 const TB_STATUS_EXISTS = 21;
@@ -66,9 +68,22 @@ export function deterministicTransferId(entry: LedgerEntry): bigint {
   return value;
 }
 
+/**
+ * Full-entropy per-credential account id: the first 16 bytes (128 bits) of
+ * SHA-256 over the namespaced credential id. The retired v1 derivation
+ * truncated the digest to 8 bytes and reduced it modulo 1e9 (~30 bits of
+ * entropy), so distinct credentials could collide onto one account and share
+ * revocation postings. The v2 namespace makes this a clean switch: v1 and v2
+ * ids never overlap, and v1 accounts are simply never created again
+ * (acceptable because the ledger is prototype-phase with no live balances).
+ */
 export function credentialAccountId(credentialId: string): bigint {
-  const digest = createHash("sha256").update(`blueeconomy.credential-account.v1|${credentialId}`, "utf8").digest();
-  return (BigInt(`0x${digest.subarray(0, 8).toString("hex")}`) % 1_000_000_000n) + STATUS_ACCOUNT_BASE;
+  const digest = createHash("sha256").update(`blueeconomy.credential-account.v2|${credentialId}`, "utf8").digest();
+  const value = BigInt(`0x${digest.subarray(0, 16).toString("hex")}`);
+  if (value === 0n || value === (1n << 128n) - 1n || value === NIMASA_CLEARING_ACCOUNT) {
+    throw new Error("credential account id collided with a reserved value");
+  }
+  return value;
 }
 
 export function ledgerCommitHash(transferId: bigint, entry: LedgerEntry): string {
@@ -107,10 +122,14 @@ export class TigerBeetleIssuanceLedger implements IssuanceLedger {
         throw new Error(`TigerBeetle account creation failed with status ${error.result}`);
       }
     }
+    // Issuance debits the NIMASA clearing account into the credential's
+    // account; revocation posts the counter-entry in the reverse direction so
+    // the credential's ledger balance is reversed rather than doubled.
+    const issuanceDirection = entry.kind === "issuance";
     const transfer = {
       id: transferId,
-      debit_account_id: NIMASA_CLEARING_ACCOUNT,
-      credit_account_id: accountId,
+      debit_account_id: issuanceDirection ? NIMASA_CLEARING_ACCOUNT : accountId,
+      credit_account_id: issuanceDirection ? accountId : NIMASA_CLEARING_ACCOUNT,
       amount: 1n,
       pending_id: 0n,
       user_data_128: 0n,

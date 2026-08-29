@@ -87,3 +87,51 @@ test("credential account ids are stable and non-zero", () => {
   assert.equal(account, credentialAccountId(entry.credentialId));
   assert.ok(account > 0n);
 });
+
+test("CV-1: revocation posts the counter-entry in the reverse direction of issuance", async () => {
+  const client = fakeClient([]);
+  const ledger = new TigerBeetleIssuanceLedger({ clusterId: 0n, replicaAddresses: ["3000"], ledger: 1, client });
+  const NIMASA_CLEARING = 7_100_000_001n;
+  const account = credentialAccountId(entry.credentialId);
+
+  await ledger.record(entry);
+  await ledger.record({ ...entry, kind: "revocation", occurredAt: "2026-06-02T00:00:00.000Z" });
+  assert.equal(client.transfers.length, 2);
+  const [issuance, revocation] = client.transfers as [{
+    debit_account_id: bigint;
+    credit_account_id: bigint;
+    code: number;
+  }, {
+    debit_account_id: bigint;
+    credit_account_id: bigint;
+    code: number;
+  }];
+  assert.equal(issuance.debit_account_id, NIMASA_CLEARING, "issuance debits the NIMASA clearing account");
+  assert.equal(issuance.credit_account_id, account, "issuance credits the credential account");
+  assert.equal(revocation.debit_account_id, account, "revocation reverses the direction: the credential account is debited back");
+  assert.equal(revocation.credit_account_id, NIMASA_CLEARING, "revocation credits the NIMASA clearing account back");
+  assert.equal(issuance.code, 7101);
+  assert.equal(revocation.code, 7102, "revocation keeps its distinct transfer code");
+});
+
+test("CV-1: account ids carry 128 bits of entropy and never collide on an 8-byte prefix", () => {
+  // Two credential ids that share their first 8 bytes (and any truncation of
+  // the old 8-byte derivation's input space) must still map to distinct,
+  // full-range 128-bit accounts.
+  const left = credentialAccountId("urn:uuid:00000000-aaaa-0000-0000-000000000001");
+  const right = credentialAccountId("urn:uuid:00000000-aaaa-0000-0000-000000000002");
+  assert.notEqual(left, right);
+  // Full 128-bit range: across many credentials the derivation must use the
+  // upper 64 bits (the retired derivation never exceeded ~2^30).
+  const seen = new Set<bigint>();
+  let above64Bits = 0;
+  for (let index = 0; index < 256; index += 1) {
+    const account = credentialAccountId(`urn:uuid:00000000-0000-0000-0000-${String(index).padStart(12, "0")}`);
+    assert.ok(account > 0n && account < (1n << 128n));
+    if (account >= (1n << 64n)) above64Bits += 1;
+    seen.add(account);
+  }
+  assert.equal(seen.size, 256, "no collisions across 256 credential ids");
+  assert.ok(above64Bits > 0, "account ids must span the full 128-bit range");
+  assert.ok(!seen.has(7_100_000_001n), "no credential maps onto the NIMASA clearing account");
+});
