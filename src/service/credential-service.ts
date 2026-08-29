@@ -22,6 +22,7 @@ import {
 } from "../vc/status-list.js";
 import { verifyCoCCredential, type VerificationResult } from "../vc/verifier.js";
 import type { SeafarerCoCCredential } from "../vc/types.js";
+import { withSpan } from "../telemetry/spans.js";
 
 /**
  * Composition layer for issuance, verification, revocation and status-list
@@ -87,6 +88,17 @@ export class CredentialService {
   public constructor(private readonly deps: CredentialServiceDependencies) {}
 
   public async issueCredential(input: IssueCredentialInput, principal: Principal): Promise<IssuedCredentialResult> {
+    // Phase-7 OTel: manual span on the issuance decision path. No PII on the
+    // span — no holder/seafarer identifiers, only operational attributes.
+    return withSpan("vc.issue", {
+      attributes: { "vc.stcw_regulation": input.stcwRegulation },
+    }, async (span) => {
+      const result = await this.issueCredentialInner(input, principal, span);
+      return result;
+    });
+  }
+
+  private async issueCredentialInner(input: IssueCredentialInput, principal: Principal, span: { setAttribute(key: string, value: string | number | boolean): void }): Promise<IssuedCredentialResult> {
     const decision = await this.deps.eligibilityGate.check(input.workflowId, input.seafarerId);
     if (!decision.eligible) {
       throw new ServiceError(409, `seafarer workflow has not reached credential eligibility (stage ${decision.observation.stage})`);
@@ -151,6 +163,8 @@ export class CredentialService {
         validUntil,
       },
     }, outbox);
+    span.setAttribute("vc.status_list_index", statusListIndex);
+    span.setAttribute("ledger.idempotent_replay", commit.idempotentReplay);
     return { credential, eventId: envelope.eventId, ledgerCommitHash: commit.commitHash };
   }
 
@@ -252,24 +266,37 @@ export class CredentialService {
   }
 
   public async verifyCredential(credential: unknown, holderId: string): Promise<VerificationResult> {
-    if (typeof holderId !== "string" || holderId.trim().length === 0) {
-      throw new ServiceError(400, "holderId is required for holder binding verification");
-    }
-    const statusListCredential = await this.currentStatusListCredential();
-    try {
-      return verifyCoCCredential({
-        credential,
-        issuerPublicKey: issuerVerificationKey(this.deps.issuer),
-        expectedIssuer: this.deps.issuer.issuerDid,
-        expectedHolderId: holderId,
-        statusListCredential,
-      });
-    } catch (error) {
-      throw new ServiceError(422, error instanceof Error ? error.message : "credential verification failed");
-    }
+    // Phase-7 OTel: manual span on the verification decision path. Only the
+    // outcome and the checked status-list index are attributed — no PII.
+    return withSpan("vc.verify", {}, async (span) => {
+      if (typeof holderId !== "string" || holderId.trim().length === 0) {
+        throw new ServiceError(400, "holderId is required for holder binding verification");
+      }
+      const statusListCredential = await this.currentStatusListCredential();
+      try {
+        const result = verifyCoCCredential({
+          credential,
+          issuerPublicKey: issuerVerificationKey(this.deps.issuer),
+          expectedIssuer: this.deps.issuer.issuerDid,
+          expectedHolderId: holderId,
+          statusListCredential,
+        });
+        span.setAttribute("vc.verification.passed", true);
+        span.setAttribute("vc.checked_status_list_index", result.checkedStatusListIndex);
+        return result;
+      } catch (error) {
+        span.setAttribute("vc.verification.passed", false);
+        throw new ServiceError(422, error instanceof Error ? error.message : "credential verification failed");
+      }
+    });
   }
 
   public async revokeCredential(input: RevokeCredentialInput, principal: Principal): Promise<{ eventId: string; ledgerCommitHash: string }> {
+    // Phase-7 OTel: manual span on the revocation decision path; no PII.
+    return withSpan("vc.revoke", {}, (span) => this.revokeCredentialInner(input, principal, span));
+  }
+
+  private async revokeCredentialInner(input: RevokeCredentialInput, principal: Principal, span: { setAttribute(key: string, value: string | number | boolean): void }): Promise<{ eventId: string; ledgerCommitHash: string }> {
     const existing = await this.deps.statusStore.getStatus(input.credentialId, this.deps.issuer.issuerDid);
     if (existing === undefined) throw new ServiceError(404, "credential is unknown to this issuer");
     if (existing.status === "REVOKED") throw new ServiceError(409, "credential is already revoked; revocation is terminal");
@@ -303,6 +330,7 @@ export class CredentialService {
       statusListIndex: existing.statusListIndex,
       effectiveAt: now,
     }, { topic: "seafarer.revocation.v1", eventId: envelope.eventId, payload: envelope as unknown as Record<string, unknown> });
+    span.setAttribute("ledger.idempotent_replay", commit.idempotentReplay);
     return { eventId: envelope.eventId, ledgerCommitHash: commit.commitHash };
   }
 

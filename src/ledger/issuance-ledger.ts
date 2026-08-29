@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto";
+import { SpanKind } from "@opentelemetry/api";
+import { withSpan } from "../telemetry/spans.js";
 
 /**
  * TigerBeetle-backed issuance ledger behind a small interface. Every issuance
@@ -102,6 +104,20 @@ export class TigerBeetleIssuanceLedger implements IssuanceLedger {
   }
 
   public async record(entry: LedgerEntry): Promise<LedgerCommit> {
+    // Phase-7 OTel (OTEL_DESIGN.md §3 TigerBeetle row): TB core has no native
+    // OTel, so coverage is a client-side span at every ledger op. No-op when
+    // telemetry is disabled; the posting semantics are unchanged.
+    return withSpan("tigerbeetle.record", {
+      kind: SpanKind.CLIENT,
+      attributes: {
+        "db.system": "tigerbeetle",
+        "ledger.entry.kind": entry.kind,
+        "ledger.id": this.options.ledger,
+      },
+    }, (span) => this.recordEntry(entry, span));
+  }
+
+  private async recordEntry(entry: LedgerEntry, span: { setAttribute(key: string, value: string | number | boolean): void }): Promise<LedgerCommit> {
     if (entry.credentialId.trim() !== entry.credentialId || entry.credentialId.length === 0) {
       throw new Error("ledger entry credential id must be canonical non-empty text");
     }
@@ -151,6 +167,8 @@ export class TigerBeetleIssuanceLedger implements IssuanceLedger {
       }
     }
     void TB_STATUS_CREATED;
+    span.setAttribute("ledger.idempotent_replay", replayed);
+    span.setAttribute("ledger.transfer_id", transferId.toString(16).padStart(32, "0"));
     return {
       transferIdHex: transferId.toString(16).padStart(32, "0"),
       commitHash: ledgerCommitHash(transferId, entry),

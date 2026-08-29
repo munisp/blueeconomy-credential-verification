@@ -1,5 +1,7 @@
 import { Kafka, type Producer } from "kafkajs";
+import { SpanKind } from "@opentelemetry/api";
 import type { SqlExecutor } from "../status/postgres.js";
+import { injectTraceContext, withSpan } from "../telemetry/spans.js";
 
 /**
  * Transactional outbox publisher. Status transitions write envelope rows to
@@ -18,7 +20,7 @@ export interface OutboxRow {
 
 export interface KafkaProducerLike {
   connect(): Promise<void>;
-  send(batch: { topic: string; messages: Array<{ key: string; value: string }> }): Promise<unknown>;
+  send(batch: { topic: string; messages: Array<{ key: string; value: string; headers?: Record<string, string> }> }): Promise<unknown>;
   disconnect(): Promise<void>;
 }
 
@@ -59,9 +61,27 @@ export class OutboxPublisher {
         byTopic.set(row.topic, bucket);
       }
       for (const [topic, topicRows] of byTopic) {
-        await this.producer.send({
-          topic,
-          messages: topicRows.map((row) => ({ key: row.event_id, value: JSON.stringify(row.payload) })),
+        // Phase-7 OTel: PRODUCER span per topic batch with the W3C
+        // traceparent injected into each message's headers (manual carrier —
+        // consumers extract it to continue the trace). No-op propagator when
+        // telemetry is disabled, so headers stay empty and the wire format
+        // for consumers is unchanged.
+        await withSpan(`outbox.publish ${topic}`, {
+          kind: SpanKind.PRODUCER,
+          attributes: {
+            "messaging.system": "kafka",
+            "messaging.destination.name": topic,
+            "messaging.message_count": topicRows.length,
+          },
+        }, async () => {
+          await this.producer.send({
+            topic,
+            messages: topicRows.map((row) => {
+              const headers: Record<string, string> = {};
+              injectTraceContext(headers);
+              return { key: row.event_id, value: JSON.stringify(row.payload), headers };
+            }),
+          });
         });
         for (const row of topicRows) {
           await this.executor.query(MARK_PUBLISHED, [row.id]);

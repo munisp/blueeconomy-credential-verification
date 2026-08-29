@@ -1,8 +1,10 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { SpanKind, type Span } from "@opentelemetry/api";
 import { AuthenticationError, AuthorizationError, authorizeRequest, type AuthenticatedPrincipal, type KeycloakAuthenticator, type PrincipalRole, ROLE_AUDITOR, ROLE_EMPLOYER, ROLE_NIMASA_APPROVER, ROLE_PSC_INSPECTOR, ROLE_SEAFARER } from "../auth/keycloak.js";
 import type { Classification, PolicyEngine } from "../auth/pbac.js";
 import { CredentialService, ServiceError } from "../service/credential-service.js";
 import type { StatusStore } from "../status/store.js";
+import { extractInboundContext, withContext, withSpan } from "../telemetry/spans.js";
 
 /**
  * Issuer/verifier HTTP surface. The route table is the single source of
@@ -23,6 +25,8 @@ export interface HttpServiceDependencies {
   policyEngine: PolicyEngine;
   service: CredentialService;
   statusStore: StatusStore;
+  /** Optional OTel drop counter text appended to /metrics (phase-7). */
+  telemetryMetrics?: () => string;
 }
 
 const MAX_BODY_BYTES = 1 << 20;
@@ -74,7 +78,7 @@ export function createHttpService(deps: HttpServiceDependencies): { server: Serv
       await deps.statusStore.healthCheck();
       return { status: 200, body: { status: "ready" } };
     }),
-    "GET /metrics": route(/^\/metrics$/, [], null, async () => ({ status: 200, body: metrics.render(), })),
+    "GET /metrics": route(/^\/metrics$/, [], null, async () => ({ status: 200, body: metrics.render() + (deps.telemetryMetrics?.() ?? "") })),
     // Maker/checker dual control: POST /v1/credentials submits a PENDING
     // issuance request (maker); a second, distinct NIMASA-approver completes
     // it via the approve route (checker). The issued_total metric counts the
@@ -183,10 +187,42 @@ async function dispatch(
   const url = new URL(request.url ?? "/", "http://localhost");
   const path = url.pathname;
   const key = Object.keys(routes).find((candidate) => candidate.startsWith(`${method} `) && routes[candidate]?.pattern.test(path));
+  // Phase-7 OTel: SERVER span per request with the inbound W3C traceparent
+  // extracted (edge/APISIX root spans join here). No-op when telemetry is
+  // disabled; the request path — including every deny-by-default outcome —
+  // is byte-for-byte unchanged.
+  // Route keys already carry the method ("POST /v1/credentials").
+  const routeName = key ?? `${method} unknown-route`;
+  await withContext(extractInboundContext(request.headers), () =>
+    withSpan(`credential-api ${routeName}`, {
+      kind: SpanKind.SERVER,
+      attributes: {
+        "http.request.method": method,
+        "http.route": routeName,
+        "url.path": path,
+      },
+    }, async (span) => {
+      const status = await dispatchRoute(method, path, key, request, response, routes, authenticator, policyEngine, metrics, span);
+      span.setAttribute("http.response.status_code", status);
+    }));
+}
+
+async function dispatchRoute(
+  method: string,
+  path: string,
+  key: string | undefined,
+  request: IncomingMessage,
+  response: ServerResponse,
+  routes: Record<string, Route>,
+  authenticator: KeycloakAuthenticator,
+  policyEngine: PolicyEngine,
+  metrics: MetricsRegistry,
+  span: Span,
+): Promise<number> {
   const selected = key === undefined ? undefined : routes[key];
   if (key === undefined || selected === undefined) {
     writeJson(response, 404, { error: "route not found or denied by default" });
-    return;
+    return 404;
   }
   let principal: AuthenticatedPrincipal | undefined;
   if (selected.roles !== null) {
@@ -196,30 +232,45 @@ async function dispatch(
     } catch (error) {
       if (error instanceof AuthenticationError) {
         writeJson(response, 401, { error: error.message });
-        return;
+        return 401;
       }
       if (error instanceof AuthorizationError) {
         writeJson(response, 403, { error: error.message });
-        return;
+        return 403;
       }
       throw error;
+    }
+    // tenant.id attribution: the Keycloak `tenant` claim is already carried
+    // by inbound tokens and consumed by PBAC, so it may be attributed to
+    // spans without any new auth flow. No `agency` claim exists on these
+    // tokens (honesty note, OTEL_DESIGN.md §2 tenant attribution row).
+    if (principal.tenant !== undefined) {
+      span.setAttribute("tenant.id", principal.tenant);
     }
     if (selected.policy !== undefined) {
       // Embedded PBAC: deny-by-default policy evaluation on the authenticated
       // route; a route without a matching allow-rule is refused even when the
       // static role table admits the caller.
-      const decision = policyEngine.evaluate({
-        roles: principal.roles,
-        clearance: principal.clearance,
-        tenant: principal.tenant,
-        resource: selected.policy.resource,
-        action: selected.policy.action,
-        classification: selected.policy.classification,
+      const policy = selected.policy;
+      const authenticated = principal;
+      const decision = await withSpan("pbac.evaluate", {
+        attributes: { "pbac.resource": policy.resource, "pbac.action": policy.action },
+      }, async (pbacSpan) => {
+        const evaluated = policyEngine.evaluate({
+          roles: authenticated.roles,
+          clearance: authenticated.clearance,
+          tenant: authenticated.tenant,
+          resource: policy.resource,
+          action: policy.action,
+          classification: policy.classification,
+        });
+        pbacSpan.setAttribute("pbac.allowed", evaluated.allowed);
+        return evaluated;
       });
       if (!decision.allowed) {
         metrics.increment("blueeconomy_pbac_denied_total", { route: key, resource: selected.policy.resource, action: selected.policy.action });
         writeJson(response, 403, { error: "denied by policy" });
-        return;
+        return 403;
       }
     }
   }
@@ -234,9 +285,10 @@ async function dispatch(
   if (key === "GET /metrics") {
     response.writeHead(result.status, { "content-type": "text/plain; version=0.0.4" });
     response.end(String(result.body));
-    return;
+    return result.status;
   }
   writeJson(response, result.status, result.body);
+  return result.status;
 }
 
 async function readJsonBody(request: IncomingMessage): Promise<unknown> {

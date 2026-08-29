@@ -7,6 +7,7 @@ import { createIssuanceLedgerFromEnv } from "./ledger/issuance-ledger.js";
 import { enqueueOutboxMessage } from "./status/postgres.js";
 import { createLifecycleActivities } from "./temporal/activities.js";
 import { loadIssuerPrivateKey } from "./vc/issuer.js";
+import { startTelemetry, temporalWorkerInterceptors } from "./telemetry/telemetry.js";
 
 /**
  * Temporal worker entrypoint (seafarer-credential-worker in the gitops
@@ -20,6 +21,9 @@ import { loadIssuerPrivateKey } from "./vc/issuer.js";
 
 async function main(): Promise<void> {
   const env = process.env;
+  // Phase-7 OTel: guarded fail-open — no OTEL_EXPORTER_OTLP_ENDPOINT means
+  // telemetry disabled and zero OTel modules loaded; boot is unaffected.
+  const telemetry = await startTelemetry({ env });
   const address = required(env, "BLUEECONOMY_TEMPORAL_ADDRESS");
   const taskQueue = required(env, "BLUEECONOMY_TEMPORAL_TASK_QUEUE");
   const namespace = env["BLUEECONOMY_TEMPORAL_NAMESPACE"] ?? "default";
@@ -32,6 +36,9 @@ async function main(): Promise<void> {
   const pool = new pg.Pool({ connectionString: databaseUrl, max: 4, connectionTimeoutMillis: 5_000 });
 
   const connection = await NativeConnection.connect({ address });
+  // Phase-7 OTel interceptors only when telemetry is enabled; a failed
+  // interceptor load degrades to no telemetry, never to a worker failure.
+  const interceptors = telemetry.enabled ? await temporalWorkerInterceptors() : undefined;
   const worker = await Worker.create({
     connection,
     namespace,
@@ -43,6 +50,7 @@ async function main(): Promise<void> {
       producer,
       enqueue: (message) => enqueueOutboxMessage(pool, message),
     }),
+    ...(interceptors !== undefined ? { interceptors } : {}),
   });
 
   process.on("SIGINT", () => worker.shutdown());
@@ -51,6 +59,7 @@ async function main(): Promise<void> {
   try {
     await worker.run();
   } finally {
+    await telemetry.shutdown();
     await pool.end();
     await ledger.close();
   }

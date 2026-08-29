@@ -1,4 +1,4 @@
-import { Client, Connection } from "@temporalio/client";
+import { Client, Connection, type ClientInterceptors } from "@temporalio/client";
 import { observerQuery, type WorkflowObservation } from "./workflows.js";
 
 /**
@@ -29,7 +29,10 @@ export class TemporalEligibilityGate implements EligibilityGate {
   }
 }
 
-export async function createEligibilityGateFromEnv(env: NodeJS.ProcessEnv = process.env): Promise<EligibilityGate> {
+export async function createEligibilityGateFromEnv(
+  env: NodeJS.ProcessEnv = process.env,
+  telemetry?: { interceptors: ClientInterceptors },
+): Promise<EligibilityGate> {
   const address = env["BLUEECONOMY_TEMPORAL_ADDRESS"];
   if (address === undefined || address.trim().length === 0) {
     throw new Error("Temporal is not configured: set BLUEECONOMY_TEMPORAL_ADDRESS (fail-closed)");
@@ -40,6 +43,8 @@ export async function createEligibilityGateFromEnv(env: NodeJS.ProcessEnv = proc
     ...(env["BLUEECONOMY_TEMPORAL_NAMESPACE"] !== undefined
       ? { namespace: env["BLUEECONOMY_TEMPORAL_NAMESPACE"] }
       : {}),
+    // Phase-7 OTel: client calls interceptor, only when telemetry is enabled.
+    ...(telemetry !== undefined ? { interceptors: telemetry.interceptors } : {}),
   });
   return new TemporalEligibilityGate(client.workflow);
 }
