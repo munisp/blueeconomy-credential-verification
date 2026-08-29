@@ -32,17 +32,26 @@ export function createBitstring(): Uint8Array {
   return new Uint8Array(STATUS_LIST_BYTES);
 }
 
+// W3C Bitstring Status List bit ordering is MSB-first: bit i lives in byte
+// floor(i / 8) at position 7 - (i % 8), so index 0 is 0x80 of the first
+// byte. (An earlier LSB-first layout deviated from the specification and
+// from the blueeconomy-tax-stamps implementation; verifiers reading a
+// cross-platform list would have checked the mirrored bit.)
+function bitMask(index: number): number {
+  return 1 << (7 - (index % 8));
+}
+
 export function setStatusBit(bits: Uint8Array, index: number, revoked: boolean): void {
   assertIndex(bits, index);
   const byteIndex = Math.floor(index / 8);
-  const mask = 1 << (index % 8);
+  const mask = bitMask(index);
   const current = bits[byteIndex] ?? 0;
   bits[byteIndex] = revoked ? current | mask : current & ~mask;
 }
 
 export function getStatusBit(bits: Uint8Array, index: number): boolean {
   assertIndex(bits, index);
-  return ((bits[Math.floor(index / 8)] ?? 0) & (1 << (index % 8))) !== 0;
+  return ((bits[Math.floor(index / 8)] ?? 0) & bitMask(index)) !== 0;
 }
 
 export function encodeBitstring(bits: Uint8Array): string {
