@@ -75,10 +75,14 @@ export function createHttpService(deps: HttpServiceDependencies): { server: Serv
       return { status: 200, body: { status: "ready" } };
     }),
     "GET /metrics": route(/^\/metrics$/, [], null, async () => ({ status: 200, body: metrics.render(), })),
+    // Maker/checker dual control: POST /v1/credentials submits a PENDING
+    // issuance request (maker); a second, distinct NIMASA-approver completes
+    // it via the approve route (checker). The issued_total metric counts the
+    // actual issuance at approval time, not the pending submission.
     "POST /v1/credentials": route(/^\/v1\/credentials$/, [], [ROLE_NIMASA_APPROVER], { resource: "credential", action: "issue", classification: "CONFIDENTIAL" }, async (request) => {
       const body = assertObject(request.body);
       const principal = assertPrincipal(request.principal);
-      const result = await deps.service.issueCredential({
+      const result = await deps.service.requestCredentialIssuance({
         workflowId: assertString(body, "workflowId"),
         seafarerId: assertString(body, "seafarerId"),
         holderId: assertString(body, "holderId"),
@@ -90,6 +94,12 @@ export function createHttpService(deps: HttpServiceDependencies): { server: Serv
         ...(typeof body["name"] === "string" ? { name: body["name"] } : {}),
         ...(typeof body["nationality"] === "string" ? { nationality: body["nationality"] } : {}),
       }, { subject: principal.subject, role: primaryRole(principal) });
+      metrics.increment("blueeconomy_vc_issuance_requested_total");
+      return { status: 202, body: result };
+    }),
+    "POST /v1/credentials/{requestId}/approve": route(/^\/v1\/credentials\/([A-Za-z0-9._:-]{1,128})\/approve$/, ["requestId"], [ROLE_NIMASA_APPROVER], { resource: "credential", action: "issue", classification: "CONFIDENTIAL" }, async (request) => {
+      const principal = assertPrincipal(request.principal);
+      const result = await deps.service.approveCredentialIssuance(request.params["requestId"] ?? "", { subject: principal.subject, role: primaryRole(principal) });
       metrics.increment("blueeconomy_vc_issued_total");
       return { status: 201, body: result };
     }),
@@ -115,14 +125,24 @@ export function createHttpService(deps: HttpServiceDependencies): { server: Serv
       if (request.params["issuer"] !== key.issuer) throw new ServiceError(404, "issuer is unknown to this service");
       return { status: 200, body: { issuer: key.issuer, kid: key.kid, public_key_hex: key.publicKeyHex } };
     }),
+    // Maker/checker dual control for revocation, mirroring issuance:
+    // POST /v1/revoke submits a PENDING revocation request; the approve
+    // route executes it under a distinct approver and only then is the
+    // revoked_total metric counted.
     "POST /v1/revoke": route(/^\/v1\/revoke$/, [], [ROLE_NIMASA_APPROVER], { resource: "credential", action: "revoke", classification: "CONFIDENTIAL" }, async (request) => {
       const body = assertObject(request.body);
       const principal = assertPrincipal(request.principal);
-      const result = await deps.service.revokeCredential({
+      const result = await deps.service.requestCredentialRevocation({
         credentialId: assertString(body, "credentialId"),
         holderId: assertString(body, "holderId"),
         reason: assertString(body, "reason"),
       }, { subject: principal.subject, role: primaryRole(principal) });
+      metrics.increment("blueeconomy_vc_revocation_requested_total");
+      return { status: 202, body: result };
+    }),
+    "POST /v1/revocations/{requestId}/approve": route(/^\/v1\/revocations\/([A-Za-z0-9._:-]{1,128})\/approve$/, ["requestId"], [ROLE_NIMASA_APPROVER], { resource: "credential", action: "revoke", classification: "CONFIDENTIAL" }, async (request) => {
+      const principal = assertPrincipal(request.principal);
+      const result = await deps.service.approveCredentialRevocation(request.params["requestId"] ?? "", { subject: principal.subject, role: primaryRole(principal) });
       metrics.increment("blueeconomy_vc_revoked_total");
       return { status: 200, body: result };
     }),

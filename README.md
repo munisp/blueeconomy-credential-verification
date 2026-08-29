@@ -17,6 +17,8 @@ Issuance is allowed only after the `SeafarerCredentialWorkflow` (Temporal) repor
 
 `exam-registration → exam-result (must pass) → training-completion → credential-eligibility → issuance`, with `revocation-requested` accepted at any time. Every stage has an SLA timer; breaches are recorded in the `observer` query without advancing the stage machine.
 
+Issuance and revocation execute under maker/checker dual control (mirroring `blueeconomy-administration-service`): one `nimasa-approver` officer submits the mutation into a persisted PENDING approval request (`credential_approval_requests`, migration 0005, which enforces `requester_subject <> approver_subject` as a database CHECK), and a second, distinct `nimasa-approver` approves it. The eligibility gate is evaluated at submission and re-evaluated at execution (fail-closed); the pending row binds payload, requester, approver and both timestamps as the audit trail.
+
 ## Temporal worker (seafarer-credential-worker)
 
 `src/worker.ts` (`npm run worker` → `node dist/worker.js`) is the lifecycle worker the gitops chart deploys as `seafarer-credential-worker`. It registers the `SeafarerCredentialWorkflow` bundle and the revocation activity (ledger commit + signed envelope + outbox row) against a Temporal task queue, and shuts down gracefully on SIGINT/SIGTERM.
@@ -27,10 +29,12 @@ Worker configuration (all fail-closed unless noted): `BLUEECONOMY_TEMPORAL_ADDRE
 
 | Route | Roles |
 | --- | --- |
-| `POST /v1/credentials` | `nimasa-approver` |
+| `POST /v1/credentials` | `nimasa-approver` (maker: submits a PENDING issuance request, 202; nothing is issued yet) |
+| `POST /v1/credentials/{requestId}/approve` | `nimasa-approver` (checker: a subject distinct from the requester; executes the issuance, 201; self-approval → 409) |
 | `POST /v1/verify` | `employer`, `psc-inspector` |
 | `GET /v1/status-list/{id}` | any approved role (incl. `auditor`, `seafarer`); 404 unless `{id}` matches the configured status-list credential id |
-| `POST /v1/revoke` | `nimasa-approver` |
+| `POST /v1/revoke` | `nimasa-approver` (maker: submits a PENDING revocation request, 202; the credential stays active) |
+| `POST /v1/revocations/{requestId}/approve` | `nimasa-approver` (checker: a subject distinct from the requester; executes the revocation, 200; self-approval → 409) |
 | `GET /v1/wallet/credentials/current` | `seafarer` (returns the authenticated holder's current ACTIVE, non-expired VC document; 404 when none) |
 | `GET /v1/issuers/{issuer}/key` | public (issuer Ed25519 public key as `{ issuer, kid, public_key_hex }` for offline eddsa-jcs-2022 verification; 404 for unknown issuers) |
 | `GET /healthz` `GET /readyz` `GET /metrics` | unauthenticated probes |

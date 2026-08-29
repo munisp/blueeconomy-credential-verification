@@ -2,6 +2,14 @@ import { readFile, readdir } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import pg from "pg";
 import {
+  ApprovalStateError,
+  assertApprovalRequest,
+  canonicalPayload,
+  type ApprovalRequest,
+  type ApprovalRequestCreated,
+  type ApprovalStore,
+} from "../service/maker-checker.js";
+import {
   assertStatusEntry,
   credentialIdReference,
   type HolderCredentialRecord,
@@ -94,6 +102,33 @@ INSERT INTO holder_credentials (
 ) VALUES ($1, $2, $3, $4::jsonb, $5)
 ON CONFLICT (credential_id_reference_sha256) DO NOTHING`;
 
+const APPROVAL_REQUEST_COLUMNS = `request_id, kind, payload::text AS payload_text, requester_subject, requester_role,
+  status, requested_at, approver_subject, decided_at`;
+
+// Maker/checker pending-approval ledger. The insert is idempotent under the
+// deterministic request id; the approve update only matches a PENDING row
+// whose requester differs from the approver (the 0005 CHECK constraint
+// backstops the separation of duties at the database layer).
+const INSERT_APPROVAL_REQUEST = `
+INSERT INTO credential_approval_requests (
+  request_id, kind, payload, requester_subject, requester_role, status, requested_at
+) VALUES ($1, $2, $3::jsonb, $4, $5, 'PENDING', $6)
+ON CONFLICT (request_id) DO NOTHING
+RETURNING ${APPROVAL_REQUEST_COLUMNS}`;
+
+const SELECT_APPROVAL_REQUEST = `
+SELECT ${APPROVAL_REQUEST_COLUMNS}
+  FROM credential_approval_requests
+ WHERE request_id = $1`;
+
+const APPROVE_PENDING_REQUEST = `
+UPDATE credential_approval_requests
+   SET status = 'APPROVED', approver_subject = $2, decided_at = now()
+ WHERE request_id = $1
+   AND status = 'PENDING'
+   AND requester_subject <> $2
+RETURNING ${APPROVAL_REQUEST_COLUMNS}`;
+
 const SELECT_CURRENT_HOLDER_CREDENTIALS = `
 SELECT h.credential_document, h.valid_until
   FROM holder_credentials h
@@ -104,7 +139,35 @@ SELECT h.credential_document, h.valid_until
    AND h.valid_until > now()
  ORDER BY h.issued_at DESC, h.credential_id_reference_sha256 ASC`;
 
-export class PgStatusStore implements StatusStore {
+interface ApprovalRequestRow extends pg.QueryResultRow {
+  request_id: string;
+  kind: ApprovalRequest["kind"];
+  payload_text: string;
+  requester_subject: string;
+  requester_role: string;
+  status: ApprovalRequest["status"];
+  requested_at: Date;
+  approver_subject: string | null;
+  decided_at: Date | null;
+}
+
+function mapApprovalRow(row: ApprovalRequestRow): ApprovalRequest {
+  const request: ApprovalRequest = {
+    requestId: row.request_id,
+    kind: row.kind,
+    payload: JSON.parse(row.payload_text) as Record<string, unknown>,
+    requesterSubject: row.requester_subject,
+    requesterRole: row.requester_role,
+    status: row.status,
+    requestedAt: new Date(row.requested_at).toISOString(),
+  };
+  if (row.approver_subject !== null) request.approverSubject = row.approver_subject;
+  if (row.decided_at !== null) request.decidedAt = new Date(row.decided_at).toISOString();
+  assertApprovalRequest(request);
+  return request;
+}
+
+export class PgStatusStore implements StatusStore, ApprovalStore {
   private readonly executor: SqlExecutor;
   private readonly onClose?: () => Promise<void>;
 
@@ -214,6 +277,44 @@ export class PgStatusStore implements StatusStore {
     return allocated;
   }
 
+  public async createApprovalRequest(request: ApprovalRequest): Promise<ApprovalRequestCreated> {
+    assertApprovalRequest(request);
+    const inserted = await this.executor.query<ApprovalRequestRow>(INSERT_APPROVAL_REQUEST, [
+      request.requestId, request.kind, JSON.stringify(request.payload),
+      request.requesterSubject, request.requesterRole, request.requestedAt,
+    ]);
+    const row = inserted.rows[0];
+    if (row !== undefined) return { created: true, record: mapApprovalRow(row) };
+    // Deterministic-id conflict: a replayed submission is a benign no-op only
+    // when the stored request is identical; anything else fails closed.
+    const existing = await this.getApprovalRequest(request.requestId);
+    if (existing === undefined) {
+      throw new Error("approval request insert conflicted but no stored request is visible (fail-closed)");
+    }
+    if (existing.kind !== request.kind || canonicalPayload(existing.payload) !== canonicalPayload(request.payload)) {
+      throw new Error(`approval request id ${request.requestId} already exists with different content (fail-closed)`);
+    }
+    return { created: false, record: existing };
+  }
+
+  public async getApprovalRequest(requestId: string): Promise<ApprovalRequest | undefined> {
+    const result = await this.executor.query<ApprovalRequestRow>(SELECT_APPROVAL_REQUEST, [requestId]);
+    const row = result.rows[0];
+    return row === undefined ? undefined : mapApprovalRow(row);
+  }
+
+  public async markApprovalRequestApproved(requestId: string, approverSubject: string): Promise<ApprovalRequest> {
+    const result = await this.executor.query<ApprovalRequestRow>(APPROVE_PENDING_REQUEST, [requestId, approverSubject]);
+    const row = result.rows[0];
+    if (row !== undefined) return mapApprovalRow(row);
+    // The guarded update only yields no row when the request is missing,
+    // already decided, or a maker/checker self-approval; report truthfully.
+    const current = await this.getApprovalRequest(requestId);
+    if (current === undefined) throw new ApprovalStateError("approval request is unknown");
+    if (current.status !== "PENDING") throw new ApprovalStateError("approval request is already approved");
+    throw new ApprovalStateError("maker/checker violation: the requester cannot approve their own credential mutation");
+  }
+
   public async healthCheck(): Promise<void> {
     await this.executor.query("SELECT 1");
   }
@@ -315,7 +416,7 @@ export async function runMigrations(executor: SqlExecutor, migrationsDirectory: 
  * the single-process JSONL store exists only when the explicit test flag
  * BLUEECONOMY_STATUS_JSONL_TEST_PATH is set.
  */
-export async function createStatusStoreFromEnv(env: NodeJS.ProcessEnv = process.env): Promise<StatusStore> {
+export async function createStatusStoreFromEnv(env: NodeJS.ProcessEnv = process.env): Promise<StatusStore & ApprovalStore> {
   const databaseUrl = env["BLUEECONOMY_STATUS_DATABASE_URL"];
   const jsonlTestPath = env["BLUEECONOMY_STATUS_JSONL_TEST_PATH"];
   if (databaseUrl !== undefined && databaseUrl.trim().length > 0) {

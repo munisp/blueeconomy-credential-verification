@@ -35,6 +35,9 @@ async function main(): Promise<void> {
   const service = new CredentialService({
     issuer: { issuerDid, verificationMethod, privateKey, statusListCredentialUrl: statusListId },
     statusStore,
+    // Maker/checker pending-approval ledger (migration 0005), served by the
+    // same durable store as the credential status registry.
+    approvals: statusStore,
     ledger,
     eligibilityGate,
     producer,

@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { PgStatusStore, createStatusStoreFromEnv, runMigrations, type SqlExecutor } from "../src/status/postgres.js";
+import { deterministicApprovalRequestId } from "../src/service/maker-checker.js";
 import type { OutboxMessage, StatusEntry } from "../src/status/store.js";
 
 interface RecordedQuery { text: string; params: readonly unknown[] }
@@ -109,6 +110,57 @@ test("postgres status lookup binds parameters and returns undefined when absent"
   assert.match(String(lookup.params[0]), /^[0-9a-f]{64}$/);
 });
 
+test("postgres approval store persists pending maker/checker requests with bound parameters", async () => {
+  const payload = { workflowId: "wf-1" };
+  const { executor, queries } = recordingExecutor((query) => {
+    if (query.text.includes("INSERT INTO credential_approval_requests")) {
+      return {
+        rows: [{
+          request_id: deterministicApprovalRequestId("issuance", payload),
+          kind: "issuance",
+          payload_text: JSON.stringify(payload),
+          requester_subject: "principal-01",
+          requester_role: "nimasa-approver",
+          status: "PENDING",
+          requested_at: new Date("2026-06-01T00:00:00.000Z"),
+          approver_subject: null,
+          decided_at: null,
+        }],
+      };
+    }
+    return { rows: [] };
+  });
+  const store = new PgStatusStore({ executor });
+  const result = await store.createApprovalRequest({
+    requestId: deterministicApprovalRequestId("issuance", payload),
+    kind: "issuance",
+    payload,
+    requesterSubject: "principal-01",
+    requesterRole: "nimasa-approver",
+    status: "PENDING",
+    requestedAt: "2026-06-01T00:00:00.000Z",
+  });
+  assert.equal(result.created, true);
+  const insert = queries.find((query) => query.text.includes("INSERT INTO credential_approval_requests"));
+  assert.ok(insert !== undefined);
+  assert.ok(insert.text.includes("ON CONFLICT (request_id) DO NOTHING"), "submission must be idempotent under the deterministic id");
+  assert.ok(!insert.text.includes("principal-01"), "subjects must be bound parameters, never interpolated");
+});
+
+test("postgres approval store only approves a pending row of a distinct approver", async () => {
+  const { executor, queries } = recordingExecutor(() => ({ rows: [] }));
+  const store = new PgStatusStore({ executor });
+  await assert.rejects(
+    () => store.markApprovalRequestApproved("urn:uuid:11111111-2222-3333-4444-555555555555", "principal-02"),
+    /unknown/,
+  );
+  const approve = queries.find((query) => query.text.includes("UPDATE credential_approval_requests"));
+  assert.ok(approve !== undefined);
+  assert.ok(approve.text.includes("status = 'PENDING'"), "the guarded update must only match PENDING rows");
+  assert.ok(approve.text.includes("requester_subject <> $2"), "the SQL must refuse maker/checker self-approval");
+  assert.deepEqual(approve.params, ["urn:uuid:11111111-2222-3333-4444-555555555555", "principal-02"]);
+});
+
 test("status store factory fails closed without configuration", async () => {
   await assert.rejects(
     () => createStatusStoreFromEnv({}),
@@ -147,7 +199,7 @@ test("migration runner applies pending files once and is parameterized", async (
   const migrationsDirectory = join(new URL("..", import.meta.url).pathname, "migrations");
   const { executor, queries } = recordingExecutor(() => ({ rows: [] }));
   const applied = await runMigrations(executor, migrationsDirectory);
-  assert.deepEqual(applied, ["0001_credential_status", "0002_holder_credentials", "0003_status_list_allocator", "0004_revocation_terminal"]);
+  assert.deepEqual(applied, ["0001_credential_status", "0002_holder_credentials", "0003_status_list_allocator", "0004_revocation_terminal", "0005_credential_approval_requests"]);
   const lookup = queries.find((query) => query.text.includes("FROM schema_migrations WHERE migration = $1"));
   assert.ok(lookup !== undefined && Array.isArray(lookup.params));
   const ddl = queries.find((query) => query.text.includes("CREATE TABLE credential_status"));

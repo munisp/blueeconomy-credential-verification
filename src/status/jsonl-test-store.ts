@@ -2,6 +2,15 @@ import { readFile } from "node:fs/promises";
 import { generateKeyPairSync } from "node:crypto";
 import { StatusRegistry } from "../status-registry.js";
 import {
+  ApprovalStateError,
+  assertApprovalRequest,
+  assertMakerCheckerSeparation,
+  canonicalPayload,
+  type ApprovalRequest,
+  type ApprovalRequestCreated,
+  type ApprovalStore,
+} from "../service/maker-checker.js";
+import {
   assertStatusEntry,
   credentialIdReference,
   type CredentialStatus,
@@ -32,7 +41,7 @@ interface JsonlLine {
  * to select it when a production database URL is present. Exists so unit
  * tests and local tooling can run without a PostgreSQL instance.
  */
-export function createJsonlTestStatusStore(path: string, env: NodeJS.ProcessEnv): StatusStore {
+export function createJsonlTestStatusStore(path: string, env: NodeJS.ProcessEnv): StatusStore & ApprovalStore {
   if (env["BLUEECONOMY_STATUS_JSONL_TEST_PATH"] === undefined) {
     throw new Error("JSONL status store requires the explicit BLUEECONOMY_STATUS_JSONL_TEST_PATH test flag");
   }
@@ -42,6 +51,7 @@ export function createJsonlTestStatusStore(path: string, env: NodeJS.ProcessEnv)
   const placementByCredential = new Map<string, { statusListId: string; statusListIndex: number }>();
   const nextIndexByList = new Map<string, number>();
   const holderCredentials = new Map<string, { holderId: string; document: Record<string, unknown>; validUntil: Date }>();
+  const approvalRequests = new Map<string, ApprovalRequest>();
 
   async function readLines(): Promise<JsonlLine[]> {
     let content: string;
@@ -147,6 +157,38 @@ export function createJsonlTestStatusStore(path: string, env: NodeJS.ProcessEnv)
       }
       nextIndexByList.set(statusListId, next + 1);
       return next;
+    },
+    async createApprovalRequest(request: ApprovalRequest): Promise<ApprovalRequestCreated> {
+      assertApprovalRequest(request);
+      const existing = approvalRequests.get(request.requestId);
+      if (existing !== undefined) {
+        if (existing.kind !== request.kind || canonicalPayload(existing.payload) !== canonicalPayload(request.payload)) {
+          throw new Error(`approval request id ${request.requestId} already exists with different content (fail-closed)`);
+        }
+        return { created: false, record: existing };
+      }
+      const record = { ...request };
+      approvalRequests.set(request.requestId, record);
+      return { created: true, record };
+    },
+    async getApprovalRequest(requestId: string): Promise<ApprovalRequest | undefined> {
+      const record = approvalRequests.get(requestId);
+      return record === undefined ? undefined : { ...record };
+    },
+    async markApprovalRequestApproved(requestId: string, approverSubject: string): Promise<ApprovalRequest> {
+      const record = approvalRequests.get(requestId);
+      if (record === undefined) throw new ApprovalStateError("approval request is unknown");
+      if (record.status !== "PENDING") throw new ApprovalStateError("approval request is already approved");
+      assertMakerCheckerSeparation(record.requesterSubject, approverSubject);
+      const approved: ApprovalRequest = {
+        ...record,
+        status: "APPROVED",
+        approverSubject,
+        decidedAt: new Date().toISOString(),
+      };
+      assertApprovalRequest(approved);
+      approvalRequests.set(requestId, approved);
+      return { ...approved };
     },
     async healthCheck(): Promise<void> {
       // File-backed test store has no liveness dependency.

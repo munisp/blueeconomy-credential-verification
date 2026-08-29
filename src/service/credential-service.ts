@@ -1,6 +1,13 @@
 import { createHash, createPublicKey, type KeyObject } from "node:crypto";
 import { buildPlatformEnvelope, deterministicEventId, vcDocumentReferenceResource } from "../events/envelope.js";
 import type { IssuanceLedger } from "../ledger/issuance-ledger.js";
+import {
+  ApprovalStateError,
+  assertMakerCheckerSeparation,
+  deterministicApprovalRequestId,
+  type ApprovalRequest,
+  type ApprovalStore,
+} from "./maker-checker.js";
 import type { EligibilityGate } from "../temporal/eligibility-gate.js";
 import type { OutboxMessage, StatusStore } from "../status/store.js";
 import { canonicalizeJson, asJsonValue, type JsonValue } from "../vc/jcs.js";
@@ -20,6 +27,10 @@ import type { SeafarerCoCCredential } from "../vc/types.js";
  * Composition layer for issuance, verification, revocation and status-list
  * publication. Issuance is gated on the credential-eligibility workflow stage
  * and the caller principal (role enforcement happens at the HTTP edge).
+ * Issuance and revocation execute under maker/checker dual control: one
+ * NIMASA-approver-tier officer submits a persisted PENDING request and a
+ * second, distinct officer approves it; only then does the mutation run
+ * (with the eligibility gate re-evaluated at execution time, fail-closed).
  */
 
 export interface IssueCredentialInput {
@@ -52,9 +63,19 @@ export interface RevokeCredentialInput {
   reason: string;
 }
 
+/** Pending maker/checker request returned to the submitting officer. */
+export interface PendingApprovalResult {
+  requestId: string;
+  kind: "issuance" | "revocation";
+  status: "PENDING";
+  requester: string;
+  requestedAt: string;
+}
+
 export interface CredentialServiceDependencies {
   issuer: IssuerConfiguration;
   statusStore: StatusStore;
+  approvals: ApprovalStore;
   ledger: IssuanceLedger;
   eligibilityGate: EligibilityGate;
   producer: string;
@@ -131,6 +152,103 @@ export class CredentialService {
       },
     }, outbox);
     return { credential, eventId: envelope.eventId, ledgerCommitHash: commit.commitHash };
+  }
+
+  /**
+   * Maker step of dual-control issuance: validates the request against the
+   * eligibility gate (re-evaluated again at execution) and persists a
+   * PENDING approval request. Nothing is issued at this point.
+   */
+  public async requestCredentialIssuance(input: IssueCredentialInput, principal: Principal): Promise<PendingApprovalResult> {
+    const decision = await this.deps.eligibilityGate.check(input.workflowId, input.seafarerId);
+    if (!decision.eligible) {
+      throw new ServiceError(409, `seafarer workflow has not reached credential eligibility (stage ${decision.observation.stage})`);
+    }
+    if (!Number.isFinite(Date.parse(input.validUntil))) throw new ServiceError(400, "validUntil must be a valid date-time");
+    const credentialId = `urn:uuid:${deterministicEventId("seafarer.credential.v1", `issue|${input.workflowId}|${input.holderId}`)}`;
+    const existingStatus = await this.deps.statusStore.getStatus(credentialId, this.deps.issuer.issuerDid);
+    if (existingStatus?.status === "REVOKED") {
+      throw new ServiceError(409, "credential is revoked; re-issuance is prohibited because revocation is terminal");
+    }
+    return this.submitApprovalRequest("issuance", { ...input }, principal);
+  }
+
+  /**
+   * Checker step of dual-control issuance: a distinct NIMASA-approver-tier
+   * officer approves the pending request and the credential is issued.
+   */
+  public async approveCredentialIssuance(requestId: string, principal: Principal): Promise<IssuedCredentialResult> {
+    const request = await this.pendingRequest(requestId, "issuance", principal);
+    const result = await this.issueCredential(issueInputFromPayload(request.payload), principal);
+    await this.markApproved(request.requestId, principal.subject);
+    return result;
+  }
+
+  /**
+   * Maker step of dual-control revocation: verifies the credential exists
+   * and is not already revoked, then persists a PENDING approval request.
+   * The status bit is not flipped until a distinct approver completes.
+   */
+  public async requestCredentialRevocation(input: RevokeCredentialInput, principal: Principal): Promise<PendingApprovalResult> {
+    const existing = await this.deps.statusStore.getStatus(input.credentialId, this.deps.issuer.issuerDid);
+    if (existing === undefined) throw new ServiceError(404, "credential is unknown to this issuer");
+    if (existing.status === "REVOKED") throw new ServiceError(409, "credential is already revoked; revocation is terminal");
+    return this.submitApprovalRequest("revocation", { ...input }, principal);
+  }
+
+  /**
+   * Checker step of dual-control revocation: a distinct NIMASA-approver-tier
+   * officer approves the pending request and the revocation executes.
+   */
+  public async approveCredentialRevocation(requestId: string, principal: Principal): Promise<{ eventId: string; ledgerCommitHash: string }> {
+    const request = await this.pendingRequest(requestId, "revocation", principal);
+    const result = await this.revokeCredential(revokeInputFromPayload(request.payload), principal);
+    await this.markApproved(request.requestId, principal.subject);
+    return result;
+  }
+
+  private async submitApprovalRequest(
+    kind: "issuance" | "revocation",
+    payload: Record<string, unknown>,
+    principal: Principal,
+  ): Promise<PendingApprovalResult> {
+    const request: ApprovalRequest = {
+      requestId: deterministicApprovalRequestId(kind, payload),
+      kind,
+      payload,
+      requesterSubject: principal.subject,
+      requesterRole: principal.role,
+      status: "PENDING",
+      requestedAt: new Date().toISOString(),
+    };
+    const { record } = await this.deps.approvals.createApprovalRequest(request);
+    if (record.status !== "PENDING") {
+      throw new ServiceError(409, "an identical request was already approved and executed");
+    }
+    return { requestId: record.requestId, kind: record.kind, status: "PENDING", requester: record.requesterSubject, requestedAt: record.requestedAt };
+  }
+
+  private async pendingRequest(requestId: string, kind: "issuance" | "revocation", principal: Principal): Promise<ApprovalRequest> {
+    const request = await this.deps.approvals.getApprovalRequest(requestId);
+    if (request === undefined) throw new ServiceError(404, "approval request is unknown");
+    if (request.kind !== kind) throw new ServiceError(409, `approval request ${requestId} is a ${request.kind} request`);
+    if (request.status !== "PENDING") throw new ServiceError(409, "approval request is already approved");
+    try {
+      assertMakerCheckerSeparation(request.requesterSubject, principal.subject);
+    } catch (error) {
+      if (error instanceof ApprovalStateError) throw new ServiceError(409, error.message);
+      throw error;
+    }
+    return request;
+  }
+
+  private async markApproved(requestId: string, approverSubject: string): Promise<void> {
+    try {
+      await this.deps.approvals.markApprovalRequestApproved(requestId, approverSubject);
+    } catch (error) {
+      if (error instanceof ApprovalStateError) throw new ServiceError(409, error.message);
+      throw error;
+    }
   }
 
   public async verifyCredential(credential: unknown, holderId: string): Promise<VerificationResult> {
@@ -245,6 +363,48 @@ export class CredentialService {
     }, this.deps.issuer.privateKey);
     return { ...unsigned, proof: proof as unknown as Record<string, JsonValue> };
   }
+}
+
+function payloadString(payload: Record<string, unknown>, field: string): string {
+  const value = payload[field];
+  if (typeof value !== "string" || value.trim() !== value || value.length === 0) {
+    throw new ServiceError(422, `stored approval request payload field ${field} is invalid (fail-closed)`);
+  }
+  return value;
+}
+
+function payloadStringArray(payload: Record<string, unknown>, field: string): string[] {
+  const value = payload[field];
+  if (!Array.isArray(value) || value.some((entry) => typeof entry !== "string")) {
+    throw new ServiceError(422, `stored approval request payload field ${field} is invalid (fail-closed)`);
+  }
+  return value as string[];
+}
+
+/** Re-validates a persisted issuance payload fail-closed before execution. */
+export function issueInputFromPayload(payload: Record<string, unknown>): IssueCredentialInput {
+  const input: IssueCredentialInput = {
+    workflowId: payloadString(payload, "workflowId"),
+    seafarerId: payloadString(payload, "seafarerId"),
+    holderId: payloadString(payload, "holderId"),
+    seafarerReferenceNumber: payloadString(payload, "seafarerReferenceNumber"),
+    capacity: payloadString(payload, "capacity"),
+    stcwRegulation: payloadString(payload, "stcwRegulation"),
+    limitations: payloadStringArray(payload, "limitations"),
+    validUntil: payloadString(payload, "validUntil"),
+  };
+  if (typeof payload["name"] === "string") input.name = payload["name"];
+  if (typeof payload["nationality"] === "string") input.nationality = payload["nationality"];
+  return input;
+}
+
+/** Re-validates a persisted revocation payload fail-closed before execution. */
+export function revokeInputFromPayload(payload: Record<string, unknown>): RevokeCredentialInput {
+  return {
+    credentialId: payloadString(payload, "credentialId"),
+    holderId: payloadString(payload, "holderId"),
+    reason: payloadString(payload, "reason"),
+  };
 }
 
 export class ServiceError extends Error {
