@@ -327,6 +327,29 @@ test("wallet, issuer-key and status-list-id contract for the mobile app", async 
   });
 });
 
+test("CV-2: metrics counters attribute issuance and revocation to the correct series", async (t) => {
+  const harness = await startHarness();
+  t.after(() => harness.close());
+
+  const approver = await harness.token([ROLE_NIMASA_APPROVER]);
+  const issued = await post(harness.baseUrl, "/v1/credentials", ISSUE_BODY, approver);
+  assert.equal(issued.status, 201);
+  const credentialId = String((issued.body["credential"] as Record<string, unknown>)["id"]);
+  const revoked = await post(harness.baseUrl, "/v1/revoke", {
+    credentialId,
+    holderId: ISSUE_BODY.holderId,
+    reason: "metric attribution check",
+  }, approver);
+  assert.equal(revoked.status, 200);
+
+  const metrics = await get(harness.baseUrl, "/metrics");
+  assert.equal(metrics.status, 200);
+  const text = String(metrics.body);
+  const lines = text.split("\n");
+  assert.ok(lines.includes("blueeconomy_vc_issued_total{} 1"), `issued counter must count the issuance exactly once, got:\n${text}`);
+  assert.ok(lines.includes("blueeconomy_vc_revoked_total{} 1"), `revoked counter must count the revocation exactly once, got:\n${text}`);
+});
+
 test("authorizeRequest enforces the role matrix fail-closed", () => {
   assert.throws(() => authorizeRequest("GET", new Set(), [ROLE_AUDITOR]), AuthorizationError);
   assert.throws(() => authorizeRequest("POST", new Set([ROLE_AUDITOR]), [ROLE_AUDITOR]), AuthorizationError);
