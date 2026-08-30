@@ -448,8 +448,14 @@ function mapRow(row: StatusRow): StatusRecord {
 }
 
 function assertOutboxMessage(message: OutboxMessage): void {
-  if (message.topic !== "seafarer.credential.v1" && message.topic !== "seafarer.revocation.v1") {
-    throw new Error("outbox topic must be an approved seafarer credential topic");
+  // Phase-8: the crew-welfare module drains its CONFIDENTIAL events through
+  // this same outbox on the seafarers.welfare.v1 topic.
+  if (
+    message.topic !== "seafarer.credential.v1" &&
+    message.topic !== "seafarer.revocation.v1" &&
+    message.topic !== "seafarers.welfare.v1"
+  ) {
+    throw new Error("outbox topic must be an approved seafarer platform topic");
   }
   if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(message.eventId)) {
     throw new Error("outbox event id must be a deterministic UUID");

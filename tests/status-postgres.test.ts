@@ -199,7 +199,9 @@ test("migration runner applies pending files once and is parameterized", async (
   const migrationsDirectory = join(new URL("..", import.meta.url).pathname, "migrations");
   const { executor, queries } = recordingExecutor(() => ({ rows: [] }));
   const applied = await runMigrations(executor, migrationsDirectory);
-  assert.deepEqual(applied, ["0001_credential_status", "0002_holder_credentials", "0003_status_list_allocator", "0004_revocation_terminal", "0005_credential_approval_requests"]);
+  assert.deepEqual(applied, ["0001_credential_status", "0002_holder_credentials", "0003_status_list_allocator", "0004_revocation_terminal", "0005_credential_approval_requests", "0006_welfare_mlc"]);
+  const welfareDdl = queries.find((query) => query.text.includes("CREATE TABLE welfare_complaint"));
+  assert.ok(welfareDdl !== undefined && welfareDdl.params.length === 0, "welfare migration DDL must not interpolate values");
   const lookup = queries.find((query) => query.text.includes("FROM schema_migrations WHERE migration = $1"));
   assert.ok(lookup !== undefined && Array.isArray(lookup.params));
   const ddl = queries.find((query) => query.text.includes("CREATE TABLE credential_status"));
