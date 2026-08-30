@@ -1,5 +1,6 @@
 import { readFile } from "node:fs/promises";
 import process from "node:process";
+import pg from "pg";
 import { createAuthenticatorFromEnv } from "./auth/keycloak.js";
 import { PolicyEngine } from "./auth/pbac.js";
 import { createHttpService } from "./http/server.js";
@@ -9,6 +10,12 @@ import { createStatusStoreFromEnv } from "./status/postgres.js";
 import { createEligibilityGateFromEnv } from "./temporal/eligibility-gate.js";
 import { assertIssuerDid, loadIssuerPrivateKey } from "./vc/issuer.js";
 import { startTelemetry, temporalClientInterceptors } from "./telemetry/telemetry.js";
+import { narrativeKeyFromEnv } from "./welfare/confidentiality.js";
+import { TemporalComplaintLifecycle } from "./welfare/lifecycle.js";
+import { loadWelfarePolicyFromEnv } from "./welfare/policy.js";
+import { PgWelfareStore } from "./welfare/postgres.js";
+import { welfareRoutes } from "./welfare/routes.js";
+import { WelfareService } from "./welfare/service.js";
 
 /**
  * Production entrypoint. Every dependency is fail-closed: missing status DSN,
@@ -52,7 +59,59 @@ async function main(): Promise<void> {
     // retired in-process BLUEECONOMY_STATUS_LIST_INDEX_START counter.
     allocateStatusListIndex: () => statusStore.allocateStatusListIndex(statusListId),
   });
-  const { server } = createHttpService({ authenticator, policyEngine, service, statusStore, telemetryMetrics: telemetry.metrics });
+
+  // ---------------------------------------------------------------------
+  // Phase-8 Crew Welfare / MLC module (bounded: src/welfare/*). The signed
+  // welfare-policy document selects the Reg 2.3 regime and complaint SLA
+  // budgets; until it is deployed, complaint/rest mutation endpoints answer
+  // 503-honest (directory and referral surfaces still serve).
+  // ---------------------------------------------------------------------
+  const welfarePolicyResult = await loadWelfarePolicyFromEnv(env);
+  const welfarePool = new pg.Pool({ connectionString: required(env, "BLUEECONOMY_STATUS_DATABASE_URL"), max: 4, connectionTimeoutMillis: 5_000 });
+  const welfareStore = new PgWelfareStore({ executor: welfarePool, ownsExecutor: () => welfarePool.end() });
+  const welfareLifecycle = telemetry.enabled
+    ? await TemporalComplaintLifecycle.create(env, { interceptors: (await temporalClientInterceptors()) ?? {} })
+    : await TemporalComplaintLifecycle.create(env);
+  const welfareService = new WelfareService({
+    store: welfareStore,
+    policy: welfarePolicyResult.configured ? welfarePolicyResult.policy : undefined,
+    ...(welfarePolicyResult.configured ? {} : { policyUnavailableReason: welfarePolicyResult.reason }),
+    narrativeKey: narrativeKeyFromEnv(env),
+    signing: {
+      privateKey,
+      keyId: env["BLUEECONOMY_WELFARE_SIGNING_KID"] ?? `${producer}-1`,
+    },
+    producer,
+    identity: {
+      // seafarerReferenceNumber VC identity binding (repo convention): the
+      // complaint binds to the caller's current CoC credential subject claim.
+      referenceFor: async (subject) => {
+        const credentials = await statusStore.listCurrentHolderCredentials(subject, issuerDid);
+        for (const credential of credentials) {
+          const subjectClaims = credential.document["credentialSubject"];
+          if (typeof subjectClaims === "object" && subjectClaims !== null) {
+            const reference = (subjectClaims as Record<string, unknown>)["seafarerReferenceNumber"];
+            if (typeof reference === "string" && reference.trim() === reference && reference.length > 0) return reference;
+          }
+        }
+        return undefined;
+      },
+    },
+    lifecycle: welfareLifecycle,
+    curationContact: env["BLUEECONOMY_WELFARE_CURATION_CONTACT"] ?? "NIMASA welfare desk (directory curation pending)",
+  });
+  if (!welfarePolicyResult.configured) {
+    process.stdout.write(`welfare: ${welfarePolicyResult.reason}\n`);
+  }
+
+  const { server } = createHttpService({
+    authenticator,
+    policyEngine,
+    service,
+    statusStore,
+    telemetryMetrics: telemetry.metrics,
+    additionalRoutes: (metrics) => welfareRoutes(welfareService, metrics),
+  });
   await new Promise<void>((resolveListen) => server.listen(port, resolveListen));
   process.stdout.write(`credential-verification listening on :${port}\n`);
   // Graceful telemetry flush (5 s ceiling inside shutdown) on stop signals.

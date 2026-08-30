@@ -31,7 +31,9 @@ CREATE INDEX credential_outbox_unpublished_idx
   ON credential_outbox (id)
   WHERE published_at IS NULL;
 
-CREATE TABLE schema_migrations (
+-- IF NOT EXISTS: the migration runner (runMigrations) pre-creates this table
+-- before applying files, so a plain CREATE TABLE would fail on a fresh schema.
+CREATE TABLE IF NOT EXISTS schema_migrations (
   migration text PRIMARY KEY,
   applied_at timestamptz NOT NULL DEFAULT now()
 );

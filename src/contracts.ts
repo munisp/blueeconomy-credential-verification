@@ -94,7 +94,19 @@ export const PLATFORM_ENVELOPE_SCHEMA: JsonSchemaDocument = {
   properties: {
     envelopeVersion: { const: "1.0" },
     eventId: { type: "string", pattern: "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$" },
-    eventType: { enum: ["seafarer.credential.v1", "seafarer.revocation.v1"] },
+    // Phase-8 crew welfare / MLC event types mirror the contracts enum
+    // (blueeconomy-contracts proto/blueeconomy/contracts/v1/welfare.proto,
+    // topic seafarers.welfare.v1).
+    eventType: {
+      enum: [
+        "seafarer.credential.v1",
+        "seafarer.revocation.v1",
+        "seafarer.welfare.complaint.v1",
+        "seafarer.welfare.complaint_status.v1",
+        "seafarer.welfare.referral.v1",
+        "seafarer.rest_hours.flagged.v1",
+      ],
+    },
     occurredAt: { type: "string", format: "date-time" },
     producer: { type: "string", minLength: 1, maxLength: 128 },
     correlationId: { type: "string", minLength: 1, maxLength: 128 },
@@ -115,8 +127,16 @@ export const PLATFORM_ENVELOPE_SCHEMA: JsonSchemaDocument = {
       properties: {
         principalId: { type: "string", minLength: 1, maxLength: 256 },
         principalRole: { type: "string", minLength: 1, maxLength: 128 },
-        signature: { type: "string", pattern: "^z[1-9A-HJ-NP-Za-km-z]+$", description: "Multibase base58btc Ed25519 signature over the SHA-256 digest of the JCS-canonical envelope payload." },
-        ledgerCommitHash: { type: "string", pattern: SHA256_HEX },
+        signature: {
+          type: "string",
+          pattern: "^(z[1-9A-HJ-NP-Za-km-z]+|[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+)$",
+          description: "Either the legacy multibase base58btc Ed25519 signature over the SHA-256 digest of the JCS-canonical envelope payload, or the fleet JWS compact serialization (EdDSA) per docs/envelope-signature.md used by phase-8 producers.",
+        },
+        // Welfare events carry an empty ledgerCommitHash (their durability
+        // binding is the transactional outbox row; the issuance TigerBeetle
+        // ledger does not cover the welfare boundary) — matching the
+        // committed contracts fixtures.
+        ledgerCommitHash: { type: "string", pattern: "^([0-9a-f]{64})?$" },
       },
     },
     classification: { const: "CONFIDENTIAL" },

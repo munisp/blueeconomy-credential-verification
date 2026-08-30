@@ -26,7 +26,11 @@
     "eventType": {
       "enum": [
         "seafarer.credential.v1",
-        "seafarer.revocation.v1"
+        "seafarer.revocation.v1",
+        "seafarer.welfare.complaint.v1",
+        "seafarer.welfare.complaint_status.v1",
+        "seafarer.welfare.referral.v1",
+        "seafarer.rest_hours.flagged.v1"
       ]
     },
     "occurredAt": {
@@ -89,12 +93,12 @@
         },
         "signature": {
           "type": "string",
-          "pattern": "^z[1-9A-HJ-NP-Za-km-z]+$",
-          "description": "Multibase base58btc Ed25519 signature over the SHA-256 digest of the JCS-canonical envelope payload."
+          "pattern": "^(z[1-9A-HJ-NP-Za-km-z]+|[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+)$",
+          "description": "Either the legacy multibase base58btc Ed25519 signature over the SHA-256 digest of the JCS-canonical envelope payload, or the fleet JWS compact serialization (EdDSA) per docs/envelope-signature.md used by phase-8 producers."
         },
         "ledgerCommitHash": {
           "type": "string",
-          "pattern": "^[0-9a-f]{64}$"
+          "pattern": "^([0-9a-f]{64})?$"
         }
       }
     },

@@ -8,7 +8,19 @@ import { createRemoteJWKSet, jwtVerify, type JWTVerifyGetKey, type JWTPayload } 
  * claim means no access.
  */
 
-export type PrincipalRole = "nimasa-approver" | "employer" | "psc-inspector" | "auditor" | "seafarer";
+export type PrincipalRole =
+  | "nimasa-approver"
+  | "employer"
+  | "psc-inspector"
+  | "auditor"
+  | "seafarer"
+  // Phase-8 crew welfare / MLC roles: NIMASA labour officers run the
+  // flag-state caseload and disclosure maker/checker; NIMASA inspectors read
+  // rest-hour breach flags; operators/masters originate rest-hour records.
+  | "nimasa-labour-officer"
+  | "nimasa-inspector"
+  | "operator"
+  | "master";
 
 export const ROLE_NIMASA_APPROVER: PrincipalRole = "nimasa-approver";
 export const ROLE_EMPLOYER: PrincipalRole = "employer";
@@ -16,9 +28,17 @@ export const ROLE_PSC_INSPECTOR: PrincipalRole = "psc-inspector";
 export const ROLE_AUDITOR: PrincipalRole = "auditor";
 /** Credential holder (wallet) role: reads only its own credentials. */
 export const ROLE_SEAFARER: PrincipalRole = "seafarer";
+/** NIMASA flag-state labour officer: welfare caseload, transitions, disclosure. */
+export const ROLE_NIMASA_LABOUR_OFFICER: PrincipalRole = "nimasa-labour-officer";
+/** NIMASA inspector: reads rest-hour breach flags. */
+export const ROLE_NIMASA_INSPECTOR: PrincipalRole = "nimasa-inspector";
+/** Vessel operator / master: originate Reg 2.3 rest-hour records. */
+export const ROLE_OPERATOR: PrincipalRole = "operator";
+export const ROLE_MASTER: PrincipalRole = "master";
 
 export const APPROVED_ROLES: readonly PrincipalRole[] = [
   ROLE_NIMASA_APPROVER, ROLE_EMPLOYER, ROLE_PSC_INSPECTOR, ROLE_AUDITOR, ROLE_SEAFARER,
+  ROLE_NIMASA_LABOUR_OFFICER, ROLE_NIMASA_INSPECTOR, ROLE_OPERATOR, ROLE_MASTER,
 ];
 
 /** Read-only oversight role: denied every mutating route generically. */

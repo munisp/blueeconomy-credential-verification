@@ -13,6 +13,7 @@
     "schemas:generate": "tsx scripts/generate-schemas.ts",
     "start": "node dist/main.js",
     "worker": "node dist/worker.js",
+    "worker:welfare": "node dist/welfare/worker.js",
     "test": "node --test --import tsx tests/**/*.test.ts",
     "verify": "npm run build && npm test"
   },
