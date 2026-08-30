@@ -90,6 +90,21 @@ Unknown fields, unknown classification labels and malformed identifiers are boot
 
 Required (fail-closed): `BLUEECONOMY_ISSUER_DID`, `BLUEECONOMY_ISSUER_ED25519_PKCS8_PEM_PATH`, `BLUEECONOMY_STATUS_LIST_URL`, `BLUEECONOMY_STATUS_DATABASE_URL`, `BLUEECONOMY_TIGERBEETLE_ADDRESSES`, `BLUEECONOMY_TEMPORAL_ADDRESS`, `BLUEECONOMY_OIDC_JWKS_URL`, `BLUEECONOMY_OIDC_ISSUER`, `BLUEECONOMY_OIDC_AUDIENCE`, `POLICY_DIR` (PBAC policy directory). Envelope-signature consumers additionally require `KEY_DIRECTORY_PATH` (mounted producer public-key directory). Optional: `BLUEECONOMY_KAFKA_BROKERS` (outbox publisher), `BLUEECONOMY_OIDC_ROLES_CLIENT_IDS`, `PORT` (default 8080), `BLUEECONOMY_EVENT_PRODUCER`, `BLUEECONOMY_TEMPORAL_NAMESPACE`.
 
+## Crew welfare / MLC module (phase 8)
+
+`src/welfare/` implements the crew-welfare bounded context (MLC 2006 Reg 5.1.5/5.2.2 complaints with anti-victimization identity withholding and maker/checker dual control, Reg 2.3 work/rest record surfacing with policy-versioned breach flags, Reg 4.4 shore-welfare provider directory and consent-bound referrals). Routes mount under `/v1/welfare/*` and `/v1/rest-hours/*`; events publish to the Kafka topic `seafarers.welfare.v1` through the shared transactional outbox with JWS-signed envelopes (fleet scheme, `docs/envelope-signature.md` in blueeconomy-contracts). Welfare envelopes carry an empty `ledgerCommitHash` by design (documented deviation): their durability binding is the outbox row, matching the contracts fixtures (`fixtures/welfare/*.json`). Schema lives in migration `0006_welfare_mlc.sql` (append-only audit triggers, maker≠checker CHECK, Reg 5.1.5(3) redress-ack CHECK).
+
+Welfare-specific configuration:
+
+- `BLUEECONOMY_WELFARE_NARRATIVE_KEY` — 64 lowercase hex chars (32 bytes), AES-256-GCM key for complaint narratives. Secrets are env-only; when unset, complaint intake answers 503-honest (fail-closed), never stores plaintext.
+- `BLUEECONOMY_WELFARE_POLICY_PATH` — path to the signed welfare-policy document (JWS compact, EdDSA over JCS-canonical claims, verified against `KEY_DIRECTORY_PATH`). It selects the Reg 2.3 regime (`min_rest` vs `max_work`) and the complaint SLA budgets. Unset degrades mutation endpoints to 503; a set-but-invalid document aborts startup (fail-closed).
+- `KEY_DIRECTORY_PATH` — shared producer public-key directory; also the trust root for the signed welfare policy.
+- `BLUEECONOMY_WELFARE_TASK_QUEUE` — Temporal task queue for the complaint SLA observer workflows (default `seafarer-welfare`); the welfare worker runs as `npm run worker:welfare` (`node dist/welfare/worker.js`) against `BLUEECONOMY_TEMPORAL_ADDRESS`.
+- `BLUEECONOMY_WELFARE_SIGNING_KID` — kid for emitted welfare envelopes (default `<producer>-1`).
+- `BLUEECONOMY_WELFARE_CURATION_CONTACT` — contact surfaced by the honest empty-directory state.
+
+Welfare tests: unit suites (`tests/welfare-rules-policy.test.ts`, `tests/welfare-service.test.ts`), the HTTP surface suite (`tests/welfare-http.test.ts`, 15 routes, PBAC denials included), the DB-gated suite (`tests/welfare-postgres.test.ts`, requires PostgreSQL; fresh dedicated database per run) and the broker-gated suite (`tests/welfare-broker.test.ts`, requires PostgreSQL + Kafka; drains the real outbox to `seafarers.welfare.v1` and verifies envelopes byte-for-byte with an independent consumer-side verifier).
+
 ## Schema contracts
 
 Files under `schemas/` are generated from `src/contracts.ts` (`npm run schemas:generate`). `tests/schema-drift.test.ts` fails CI whenever the committed schemas drift from the code or stop accepting the documents the code produces. Never edit the committed schema files by hand.

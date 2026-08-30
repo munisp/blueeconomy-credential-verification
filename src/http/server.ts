@@ -27,11 +27,17 @@ export interface HttpServiceDependencies {
   statusStore: StatusStore;
   /** Optional OTel drop counter text appended to /metrics (phase-7). */
   telemetryMetrics?: () => string;
+  /**
+   * Bounded add-on route tables (phase-8 crew welfare). Merged after the core
+   * credential routes; credential paths are untouched. A factory receives the
+   * shared metrics registry so add-on routes count into the same /metrics.
+   */
+  additionalRoutes?: Record<string, Route> | ((metrics: MetricsRegistry) => Record<string, Route>);
 }
 
 const MAX_BODY_BYTES = 1 << 20;
 
-interface Route {
+export interface Route {
   pattern: RegExp;
   paramNames: string[];
   roles: readonly PrincipalRole[] | null;
@@ -39,9 +45,13 @@ interface Route {
   handler: (request: RouteRequest) => Promise<{ status: number; body: unknown }>;
 }
 
-interface RouteRequest {
+export interface RouteRequest {
   method: string;
   params: Record<string, string>;
+  /** URL query parameters (first value per key). */
+  query: Record<string, string>;
+  /** Request headers (lowercased names; e.g. Idempotency-Key). */
+  headers: Record<string, string | string[] | undefined>;
   body: unknown;
   principal: AuthenticatedPrincipal | undefined;
 }
@@ -152,9 +162,15 @@ export function createHttpService(deps: HttpServiceDependencies): { server: Serv
     }),
   };
 
+  const provided = deps.additionalRoutes;
+  const allRoutes: Record<string, Route> = {
+    ...routes,
+    ...(typeof provided === "function" ? provided(metrics) : provided ?? {}),
+  };
+
   const server = createServer(async (request, response) => {
     try {
-      await dispatch(request, response, routes, deps.authenticator, deps.policyEngine, metrics);
+      await dispatch(request, response, allRoutes, deps.authenticator, deps.policyEngine, metrics);
     } catch (error) {
       writeError(response, error);
     }
@@ -162,7 +178,7 @@ export function createHttpService(deps: HttpServiceDependencies): { server: Serv
   return { server, metrics };
 }
 
-function route(
+export function route(
   pattern: RegExp,
   paramNames: string[],
   roles: readonly PrincipalRole[] | null,
@@ -279,8 +295,12 @@ async function dispatchRoute(
   selected.paramNames.forEach((name, index) => {
     params[name] = decodeURIComponent(match?.[index + 1] ?? "");
   });
+  const query: Record<string, string> = {};
+  new URL(request.url ?? "/", "http://localhost").searchParams.forEach((value, name) => {
+    if (query[name] === undefined) query[name] = value;
+  });
   const body = method === "POST" || method === "PUT" ? await readJsonBody(request) : undefined;
-  const result = await selected.handler({ method, params, body, principal });
+  const result = await selected.handler({ method, params, query, headers: request.headers, body, principal });
   metrics.increment("blueeconomy_http_requests_total", { route: key, status: String(result.status) });
   if (key === "GET /metrics") {
     response.writeHead(result.status, { "content-type": "text/plain; version=0.0.4" });
@@ -325,19 +345,19 @@ function writeJson(response: ServerResponse, status: number, body: unknown): voi
   response.end(JSON.stringify(body));
 }
 
-function assertPrincipal(principal: AuthenticatedPrincipal | undefined): AuthenticatedPrincipal {
+export function assertPrincipal(principal: AuthenticatedPrincipal | undefined): AuthenticatedPrincipal {
   if (principal === undefined) throw new ServiceError(401, "authentication is required");
   return principal;
 }
 
-function assertObject(value: unknown): Record<string, unknown> {
+export function assertObject(value: unknown): Record<string, unknown> {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     throw new ServiceError(400, "request body must be a JSON object");
   }
   return value as Record<string, unknown>;
 }
 
-function assertString(body: Record<string, unknown>, field: string): string {
+export function assertString(body: Record<string, unknown>, field: string): string {
   const value = body[field];
   if (typeof value !== "string" || value.trim() !== value || value.length === 0) {
     throw new ServiceError(400, `${field} must be canonical non-empty text`);
